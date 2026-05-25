@@ -210,6 +210,9 @@ public:
     declare_parameter("gnss.track_heading_enabled",   true);
     declare_parameter("gnss.track_heading_min_dist",  5.0);
     declare_parameter("gnss.track_heading_max_sigma", 0.4);
+    declare_parameter("gnss.track_heading_min_speed", 0.2);
+    declare_parameter("gnss.track_heading_max_yaw_rate", 0.3);
+    declare_parameter("gnss.heading_observable_distance", 5.0);
 
     declare_parameter("adaptive.imu",     true);
     declare_parameter("adaptive.encoder", true);
@@ -387,6 +390,9 @@ public:
     config.gps_track_heading_enabled   = get_parameter("gnss.track_heading_enabled").as_bool();
     config.gps_track_heading_min_dist  = get_parameter("gnss.track_heading_min_dist").as_double();
     config.gps_track_heading_max_sigma = get_parameter("gnss.track_heading_max_sigma").as_double();
+    config.gps_track_heading_min_speed = get_parameter("gnss.track_heading_min_speed").as_double();
+    config.gps_track_heading_max_yaw_rate = get_parameter("gnss.track_heading_max_yaw_rate").as_double();
+    config.heading_observable_distance = get_parameter("gnss.heading_observable_distance").as_double();
 
     config.adaptive_imu     = get_parameter("adaptive.imu").as_bool();
     config.adaptive_encoder = get_parameter("adaptive.encoder").as_bool();

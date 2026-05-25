@@ -41,6 +41,8 @@ struct FusionCoreConfig {
   bool   gps_track_heading_enabled  = true;
   double gps_track_heading_min_dist = 5.0;   // meters
   double gps_track_heading_max_sigma = 0.4;  // radians
+  double gps_track_heading_min_speed = 0.2;  // m/s
+  double gps_track_heading_max_yaw_rate = 0.3;  // rad/s
 
   // Delay compensation: state snapshot buffer
   // Mahalanobis outlier rejection

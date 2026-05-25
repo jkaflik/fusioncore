@@ -336,15 +336,10 @@ void FusionCore::update_distance_traveled(double x, double y, double pre_update_
     : std::sqrt(ukf_.state().x[VX] * ukf_.state().x[VX] +
                 ukf_.state().x[VY] * ukf_.state().x[VY]);
 
-  // Minimum forward speed to count as real motion
-  // Below this threshold: could be GPS jitter, spinning in place, or sliding
-  const double MIN_SPEED = 0.2;  // m/s
-
-  // Maximum yaw rate: if spinning fast, heading is not observable from track
-  const double MAX_YAW_RATE = 0.3;  // rad/s (~17 deg/s)
   double yaw_rate = std::abs(ukf_.state().x[WZ]);
 
-  bool motion_is_valid = (state_speed >= MIN_SPEED) && (yaw_rate <= MAX_YAW_RATE);
+  bool motion_is_valid = (state_speed >= config_.gps_track_heading_min_speed) &&
+                         (yaw_rate <= config_.gps_track_heading_max_yaw_rate);
 
   if (motion_is_valid) {
     distance_traveled_ += dist;
@@ -795,8 +790,8 @@ bool FusionCore::apply_gnss_update(
           constexpr unsigned int HDG_ANGLE_DIMS = 0b1;
 
           // Apply chi2 gate only after this fusion has fired at least once.
-          // update_distance_traveled() sets heading_validated_=true at 5m (before
-          // the 7.5m baseline needed for a reliable bearing), so heading_validated_
+          // update_distance_traveled() sets heading_validated_=true once enough
+          // valid GNSS-track distance has accumulated, so heading_validated_
           // alone is not a safe guard. A large initial heading error (>75 deg)
           // would then cause every fusion attempt to be rejected, permanently
           // blocking heading correction.
