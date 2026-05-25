@@ -2,34 +2,37 @@
 #include "fusioncore/motion_model.hpp"
 #include "fusioncore/sensors/gnss.hpp"
 #include "fusioncore/sensors/vslam.hpp"
+#include "fusioncore_ros/srv/from_ll.hpp"
 
+#include <rclcpp/executors/multi_threaded_executor.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_lifecycle/lifecycle_node.hpp>
-#include <sensor_msgs/msg/imu.hpp>
-#include <sensor_msgs/msg/nav_sat_fix.hpp>
-#include <sensor_msgs/msg/nav_sat_status.hpp>
-#include <gps_msgs/msg/gps_fix.hpp>
-#include <nav_msgs/msg/odometry.hpp>
-#include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <tf2_ros/transform_broadcaster.hpp>
-#include <tf2_ros/buffer.h>
-#include <tf2_ros/transform_listener.h>
-#include <tf2/LinearMath/Quaternion.h>
+
 #include <compass_msgs/msg/azimuth.hpp>
-#include <tf2/LinearMath/Vector3.h>
-#include <tf2/LinearMath/Matrix3x3.h>
-#include <rclcpp/executors/multi_threaded_executor.hpp>
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <diagnostic_msgs/msg/diagnostic_status.hpp>
 #include <diagnostic_msgs/msg/key_value.hpp>
+#include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
+#include <gps_msgs/msg/gps_fix.hpp>
+#include <nav_msgs/msg/odometry.hpp>
+#include <sensor_msgs/msg/imu.hpp>
+#include <sensor_msgs/msg/nav_sat_fix.hpp>
+#include <sensor_msgs/msg/nav_sat_status.hpp>
 #include <std_srvs/srv/trigger.hpp>
-#include "fusioncore_ros/srv/from_ll.hpp"
+
+#include <proj.h>
+#include <tf2/LinearMath/Matrix3x3.h>
+#include <tf2/LinearMath/Quaternion.h>
+#include <tf2/LinearMath/Vector3.h>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
+
+#include <fstream>
 #include <mutex>
 #include <optional>
 #include <set>
-#include <fstream>
 #include <sstream>
-#include <proj.h>
 
 using namespace std::chrono_literals;
 using CallbackReturn = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
@@ -37,14 +40,13 @@ using CallbackReturn = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface
 class FusionNode : public rclcpp_lifecycle::LifecycleNode
 {
 public:
-  FusionNode()
-  : rclcpp_lifecycle::LifecycleNode("fusioncore")
+  FusionNode() : rclcpp_lifecycle::LifecycleNode("fusioncore")
   {
     RCLCPP_INFO(get_logger(), "FusionCore node created");
     // Two separate mutually-exclusive groups so the publish timer never blocks
     // waiting for a sensor callback (and vice-versa). MultiThreadedExecutor
     // assigns each group its own thread, giving the publish timer its own lane.
-    sensor_cb_group_  = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    sensor_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     publish_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
   }
 
@@ -54,8 +56,8 @@ public:
   {
     RCLCPP_INFO(get_logger(), "Configuring FusionCore...");
 
-    declare_parameter("base_frame",   "base_link");
-    declare_parameter("odom_frame",   "odom");
+    declare_parameter("base_frame", "base_link");
+    declare_parameter("odom_frame", "odom");
     declare_parameter("publish_rate", 100.0);
     // Force 2D output: zero the Z position in the published odometry
     // and the odom->base TF. For ground robots where altitude is
@@ -72,7 +74,7 @@ public:
     // (e.g. Clearpath Microstrain at /sensors/imu_0/data, Realsense at /camera/imu).
     // Using a launch-time remap is equivalent and preferred for readability.
     declare_parameter("imu.topic", std::string("/imu/data"));
-    declare_parameter("imu.gyro_noise",  0.005);
+    declare_parameter("imu.gyro_noise", 0.005);
     // Set to true if IMU has a magnetometer (9-axis: BNO08x, VectorNav, Xsens)
     // Set to false for 6-axis IMUs: yaw from gyro integration drifts
     declare_parameter("imu.has_magnetometer", false);
@@ -95,7 +97,7 @@ public:
     // the primary IMU. Useful when your platform has two IMUs and you want
     // redundancy rather than pre-merging them externally (e.g. VESC IMU + D435i).
     // Leave empty to disable.
-    declare_parameter("imu2.topic",    std::string(""));
+    declare_parameter("imu2.topic", std::string(""));
     declare_parameter("imu2.frame_id", std::string(""));
     declare_parameter("imu2.remove_gravitational_acceleration", false);
 
@@ -108,7 +110,7 @@ public:
     // path as the primary wheel encoder. Per-axis covariance is taken from the
     // message twist.covariance when positive; otherwise encoder2.vel_noise and
     // encoder2.yaw_noise are used as fallback. Leave empty to disable.
-    declare_parameter("encoder2.topic",     std::string(""));
+    declare_parameter("encoder2.topic", std::string(""));
     declare_parameter("encoder2.vel_noise", 0.05);
     declare_parameter("encoder2.yaw_noise", 0.02);
 
@@ -126,17 +128,17 @@ public:
     // publishes here. Works indoors and outdoors, all weather conditions.
     // Leave empty to disable.
     declare_parameter("radar.velocity_topic", std::string(""));
-    declare_parameter("radar.vel_noise",      0.1);   // m/s fallback when msg cov <= 0
+    declare_parameter("radar.vel_noise", 0.1);  // m/s fallback when msg cov <= 0
 
-    declare_parameter("gnss.base_noise_xy",  1.0);
-    declare_parameter("gnss.base_noise_z",   2.0);
-    declare_parameter("gnss.heading_noise",  0.02);
-    declare_parameter("gnss.max_hdop",       4.0);
+    declare_parameter("gnss.base_noise_xy", 1.0);
+    declare_parameter("gnss.base_noise_z", 2.0);
+    declare_parameter("gnss.heading_noise", 0.02);
+    declare_parameter("gnss.max_hdop", 4.0);
     declare_parameter("gnss.min_satellites", 4);
     // Minimum fix type for GNSS fusion: 1=GPS, 2=DGPS, 3=RTK_FLOAT, 4=RTK_FIXED
     // Note: NavSatFix status only goes up to 2 (GBAS) which maps to RTK_FIXED.
     // RTK_FLOAT (3) is unreachable via NavSatFix alone.
-    declare_parameter("gnss.min_fix_type",  1);
+    declare_parameter("gnss.min_fix_type", 1);
 
     // Topic for dual antenna heading: sensor_msgs/Imu used as heading carrier.
     // The yaw component of orientation is the heading.
@@ -178,55 +180,63 @@ public:
     //   Set false only when output.crs is already a projected local CRS (e.g. UTM).
     // reference.use_first_fix: use first GPS fix as the local origin (default: true)
     // reference.x/y/z: fixed reference in output.crs units (used when use_first_fix=false)
-    declare_parameter("input.gnss_crs",                    std::string("EPSG:4326"));
-    declare_parameter("output.crs",                        std::string("EPSG:4978"));
+    declare_parameter("input.gnss_crs", std::string("EPSG:4326"));
+    declare_parameter("output.crs", std::string("EPSG:4978"));
     declare_parameter("output.convert_to_enu_at_reference", true);
-    declare_parameter("reference.use_first_fix",           true);
-    declare_parameter("reference.x",                       0.0);
-    declare_parameter("reference.y",                       0.0);
-    declare_parameter("reference.z",                       0.0);
+    declare_parameter("reference.use_first_fix", true);
+    declare_parameter("reference.x", 0.0);
+    declare_parameter("reference.y", 0.0);
+    declare_parameter("reference.z", 0.0);
 
-    declare_parameter("outlier_rejection",      true);
+    declare_parameter("outlier_rejection", true);
     declare_parameter("outlier_threshold_gnss", 16.27);
-    declare_parameter("outlier_threshold_imu",  15.09);
-    declare_parameter("outlier_threshold_enc",   11.34);
-    declare_parameter("outlier_threshold_hdg",   10.83);
+    declare_parameter("outlier_threshold_imu", 15.09);
+    declare_parameter("outlier_threshold_enc", 11.34);
+    declare_parameter("outlier_threshold_hdg", 10.83);
     declare_parameter("outlier_threshold_vslam", 22.46);
     // VSLAM pose input (ORB-SLAM3, RTAB-Map, Kimera, etc.)
-    declare_parameter("vslam.topic",              std::string(""));
-    declare_parameter("vslam.position_noise",     0.1);
-    declare_parameter("vslam.orientation_noise",  0.02);
-    declare_parameter("vslam.frame_id",           std::string(""));
-    declare_parameter("vslam.reinit_n",           10);
+    declare_parameter("vslam.topic", std::string(""));
+    declare_parameter("vslam.position_noise", 0.1);
+    declare_parameter("vslam.orientation_noise", 0.02);
+    declare_parameter("vslam.frame_id", std::string(""));
+    declare_parameter("vslam.reinit_n", 10);
 
-    declare_parameter("gnss.coast_n",               5);
-    declare_parameter("gnss.coast_q_factor",        20.0);
-    declare_parameter("gnss.coast_timeout_s",       0.0);
-    declare_parameter("gnss.coast_q_bias_factor",   100.0);
-    declare_parameter("gnss.coast_imu_wz_scale",    1.0);
-    declare_parameter("gnss.recovery_rejection_n",  0);
-    declare_parameter("gnss.p_inflate_sigma",       50.0);
-    declare_parameter("gnss.recovery_timeout_s",    0.0);
-    declare_parameter("gnss.track_heading_enabled",   true);
-    declare_parameter("gnss.track_heading_min_dist",  5.0);
+    declare_parameter("gnss.coast_n", 5);
+    declare_parameter("gnss.coast_q_factor", 20.0);
+    declare_parameter("gnss.coast_timeout_s", 0.0);
+    declare_parameter("gnss.coast_q_bias_factor", 100.0);
+    declare_parameter("gnss.coast_imu_wz_scale", 1.0);
+    declare_parameter("gnss.recovery_rejection_n", 0);
+    declare_parameter("gnss.p_inflate_sigma", 50.0);
+    declare_parameter("gnss.recovery_timeout_s", 0.0);
+    declare_parameter("gnss.track_heading_enabled", true);
+    declare_parameter("gnss.track_heading_min_dist", 5.0);
     declare_parameter("gnss.track_heading_max_sigma", 0.4);
     declare_parameter("gnss.track_heading_min_speed", 0.2);
     declare_parameter("gnss.track_heading_max_yaw_rate", 0.3);
     declare_parameter("gnss.heading_observable_distance", 5.0);
+    declare_parameter("gnss.rotation_heading_enabled", true);
+    declare_parameter("gnss.rotation_heading_min_yaw_delta", 1.0);
+    declare_parameter("gnss.rotation_heading_min_arc_baseline", 0.25);
+    declare_parameter("gnss.rotation_heading_max_base_translation", 0.20);
+    declare_parameter("gnss.rotation_heading_max_sigma", 0.4);
+    declare_parameter("gnss.rotation_heading_sigma_floor", 0.05);
+    declare_parameter("gnss.rotation_heading_delta_yaw_sigma", 0.03);
+    declare_parameter("gnss.rotation_heading_max_window_s", 10.0);
 
-    declare_parameter("adaptive.imu",     true);
+    declare_parameter("adaptive.imu", true);
     declare_parameter("adaptive.encoder", true);
-    declare_parameter("adaptive.gnss",    true);
-    declare_parameter("adaptive.window",  50);
-    declare_parameter("adaptive.alpha",   0.01);
+    declare_parameter("adaptive.gnss", true);
+    declare_parameter("adaptive.window", 50);
+    declare_parameter("adaptive.alpha", 0.01);
 
     // Zero-velocity update (ZUPT)
     // When encoder velocity and IMU angular rate are both below threshold,
     // the robot is considered stationary and a zero-velocity measurement is fused.
-    declare_parameter("zupt.enabled",            true);
+    declare_parameter("zupt.enabled", true);
     declare_parameter("zupt.velocity_threshold", 0.05);  // m/s
-    declare_parameter("zupt.angular_threshold",  0.05);  // rad/s
-    declare_parameter("zupt.noise_sigma",        0.01);  // m/s: tight
+    declare_parameter("zupt.angular_threshold", 0.05);   // rad/s
+    declare_parameter("zupt.noise_sigma", 0.01);         // m/s: tight
 
     // Flat-terrain Z position constraint. 0.0 = disabled (default).
     // Set to ~0.3 for campus/parking-lot/warehouse deployments where
@@ -246,13 +256,12 @@ public:
     // of measurements rather than drifting on IMU alone.
     // init.sensor_wait_timeout: give up and start anyway after this many seconds.
     declare_parameter("init.wait_for_all_sensors", false);
-    declare_parameter("init.sensor_wait_timeout",  10.0);
+    declare_parameter("init.sensor_wait_timeout", 10.0);
 
     // Checkpoint path for deterministic replay (save/load filter state).
     // ~/save_checkpoint saves the current state to this file.
     // ~/load_checkpoint restores state from this file (re-run from any point in a bag).
-    declare_parameter("replay.checkpoint_path",
-      std::string("/tmp/fusioncore_checkpoint.txt"));
+    declare_parameter("replay.checkpoint_path", std::string("/tmp/fusioncore_checkpoint.txt"));
 
     // Motion model: controls how sigma points are propagated in the predict step.
     // "ConstantVelocityAcceleration" (default): no platform constraints.
@@ -261,68 +270,68 @@ public:
     declare_parameter("motion_model", std::string("ConstantVelocityAcceleration"));
     declare_parameter("motion_model_params.wheelbase", 0.55);
 
-    declare_parameter("ukf.q_position",     0.01);
-    declare_parameter("ukf.q_orientation",  1e-9);
-    declare_parameter("ukf.q_velocity",     0.1);
-    declare_parameter("ukf.q_angular_vel",  0.1);
+    declare_parameter("ukf.q_position", 0.01);
+    declare_parameter("ukf.q_orientation", 1e-9);
+    declare_parameter("ukf.q_velocity", 0.1);
+    declare_parameter("ukf.q_angular_vel", 0.1);
     declare_parameter("ukf.q_acceleration", 1.0);
-    declare_parameter("ukf.q_gyro_bias",         1e-5);
-    declare_parameter("ukf.q_accel_bias",        1e-5);
-    declare_parameter("ukf.q_encoder_wz_bias",   1e-7);
+    declare_parameter("ukf.q_gyro_bias", 1e-5);
+    declare_parameter("ukf.q_accel_bias", 1e-5);
+    declare_parameter("ukf.q_encoder_wz_bias", 1e-7);
 
-    base_frame_   = get_parameter("base_frame").as_string();
-    odom_frame_   = get_parameter("odom_frame").as_string();
+    base_frame_ = get_parameter("base_frame").as_string();
+    odom_frame_ = get_parameter("odom_frame").as_string();
     publish_rate_ = get_parameter("publish_rate").as_double();
-    force_2d_     = get_parameter("publish.force_2d").as_bool();
-    publish_tf_   = get_parameter("publish.tf").as_bool();
+    force_2d_ = get_parameter("publish.force_2d").as_bool();
+    publish_tf_ = get_parameter("publish.tf").as_bool();
     heading_topic_ = get_parameter("gnss.heading_topic").as_string();
-    gnss2_topic_    = get_parameter("gnss.fix2_topic").as_string();
-    azimuth_topic_  = get_parameter("gnss.azimuth_topic").as_string();
-    use_gps_fix_    = get_parameter("gnss.use_gps_fix").as_bool();
+    gnss2_topic_ = get_parameter("gnss.fix2_topic").as_string();
+    azimuth_topic_ = get_parameter("gnss.azimuth_topic").as_string();
+    use_gps_fix_ = get_parameter("gnss.use_gps_fix").as_bool();
 
     fusioncore::FusionCoreConfig config;
 
-    config.imu.gyro_noise_x  = get_parameter("imu.gyro_noise").as_double();
-    config.imu.gyro_noise_y  = config.imu.gyro_noise_x;
-    config.imu.gyro_noise_z  = config.imu.gyro_noise_x;
-    config.imu.accel_noise_x    = get_parameter("imu.accel_noise").as_double();
+    config.imu.gyro_noise_x = get_parameter("imu.gyro_noise").as_double();
+    config.imu.gyro_noise_y = config.imu.gyro_noise_x;
+    config.imu.gyro_noise_z = config.imu.gyro_noise_x;
+    config.imu.accel_noise_x = get_parameter("imu.accel_noise").as_double();
     config.imu_has_magnetometer = get_parameter("imu.has_magnetometer").as_bool();
     config.imu.accel_noise_y = config.imu.accel_noise_x;
     config.imu.accel_noise_z = config.imu.accel_noise_x;
-    imu_topic_          = get_parameter("imu.topic").as_string();
+    imu_topic_ = get_parameter("imu.topic").as_string();
     imu_remove_gravity_ = get_parameter("imu.remove_gravitational_acceleration").as_bool();
     imu_frame_override_ = get_parameter("imu.frame_id").as_string();
-    RCLCPP_INFO(get_logger(), "IMU gravity removal: %s",
-      imu_remove_gravity_ ? "ENABLED" : "disabled");
+    RCLCPP_INFO(
+      get_logger(), "IMU gravity removal: %s", imu_remove_gravity_ ? "ENABLED" : "disabled");
     if (!imu_frame_override_.empty())
       RCLCPP_INFO(get_logger(), "IMU frame override: %s", imu_frame_override_.c_str());
 
-    imu2_topic_          = get_parameter("imu2.topic").as_string();
+    imu2_topic_ = get_parameter("imu2.topic").as_string();
     imu2_frame_override_ = get_parameter("imu2.frame_id").as_string();
     imu2_remove_gravity_ = get_parameter("imu2.remove_gravitational_acceleration").as_bool();
 
-    config.encoder.vel_noise_x  = get_parameter("encoder.vel_noise").as_double();
-    config.encoder.vel_noise_y  = config.encoder.vel_noise_x;
+    config.encoder.vel_noise_x = get_parameter("encoder.vel_noise").as_double();
+    config.encoder.vel_noise_y = config.encoder.vel_noise_x;
     config.encoder.vel_noise_wz = get_parameter("encoder.yaw_noise").as_double();
 
-    encoder2_topic_     = get_parameter("encoder2.topic").as_string();
-    enc2_vel_noise_     = get_parameter("encoder2.vel_noise").as_double();
-    enc2_yaw_noise_     = get_parameter("encoder2.yaw_noise").as_double();
-    gnss_vel_topic_    = get_parameter("gnss.velocity_topic").as_string();
-    radar_vel_topic_   = get_parameter("radar.velocity_topic").as_string();
-    radar_vel_noise_   = get_parameter("radar.vel_noise").as_double();
+    encoder2_topic_ = get_parameter("encoder2.topic").as_string();
+    enc2_vel_noise_ = get_parameter("encoder2.vel_noise").as_double();
+    enc2_yaw_noise_ = get_parameter("encoder2.yaw_noise").as_double();
+    gnss_vel_topic_ = get_parameter("gnss.velocity_topic").as_string();
+    radar_vel_topic_ = get_parameter("radar.velocity_topic").as_string();
+    radar_vel_noise_ = get_parameter("radar.vel_noise").as_double();
 
-    config.gnss.base_noise_xy  = get_parameter("gnss.base_noise_xy").as_double();
-    config.gnss.base_noise_z   = get_parameter("gnss.base_noise_z").as_double();
-    config.gnss.heading_noise  = get_parameter("gnss.heading_noise").as_double();
-    config.gnss.max_hdop       = get_parameter("gnss.max_hdop").as_double();
+    config.gnss.base_noise_xy = get_parameter("gnss.base_noise_xy").as_double();
+    config.gnss.base_noise_z = get_parameter("gnss.base_noise_z").as_double();
+    config.gnss.heading_noise = get_parameter("gnss.heading_noise").as_double();
+    config.gnss.max_hdop = get_parameter("gnss.max_hdop").as_double();
     config.gnss.min_satellites = get_parameter("gnss.min_satellites").as_int();
-    min_fix_type_ = static_cast<fusioncore::sensors::GnssFixType>(
-        get_parameter("gnss.min_fix_type").as_int());
+    min_fix_type_ =
+      static_cast<fusioncore::sensors::GnssFixType>(get_parameter("gnss.min_fix_type").as_int());
     config.gnss.min_fix_type = min_fix_type_;
-    RCLCPP_INFO(get_logger(),
-                "GNSS min_fix_type: %d (1=GPS, 2=DGPS, 3=RTK_FLOAT, 4=RTK_FIXED)",
-                static_cast<int>(min_fix_type_));
+    RCLCPP_INFO(
+      get_logger(), "GNSS min_fix_type: %d (1=GPS, 2=DGPS, 3=RTK_FLOAT, 4=RTK_FIXED)",
+      static_cast<int>(min_fix_type_));
     gnss_lever_arm_.x = get_parameter("gnss.lever_arm_x").as_double();
     gnss_lever_arm_.y = get_parameter("gnss.lever_arm_y").as_double();
     gnss_lever_arm_.z = get_parameter("gnss.lever_arm_z").as_double();
@@ -332,21 +341,21 @@ public:
     gnss_lever_arm2_.z = get_parameter("gnss.lever_arm2_z").as_double();
 
     if (!gnss_lever_arm_.is_zero()) {
-      RCLCPP_INFO(get_logger(),
-        "GNSS lever arm (primary) set: x=%.3f y=%.3f z=%.3f m",
-        gnss_lever_arm_.x, gnss_lever_arm_.y, gnss_lever_arm_.z);
+      RCLCPP_INFO(
+        get_logger(), "GNSS lever arm (primary) set: x=%.3f y=%.3f z=%.3f m", gnss_lever_arm_.x,
+        gnss_lever_arm_.y, gnss_lever_arm_.z);
     }
     if (!gnss_lever_arm2_.is_zero()) {
-      RCLCPP_INFO(get_logger(),
-        "GNSS lever arm (secondary) set: x=%.3f y=%.3f z=%.3f m",
-        gnss_lever_arm2_.x, gnss_lever_arm2_.y, gnss_lever_arm2_.z);
+      RCLCPP_INFO(
+        get_logger(), "GNSS lever arm (secondary) set: x=%.3f y=%.3f z=%.3f m", gnss_lever_arm2_.x,
+        gnss_lever_arm2_.y, gnss_lever_arm2_.z);
     }
 
     // Wire PROJ parameters
-    input_gnss_crs_              = get_parameter("input.gnss_crs").as_string();
-    output_crs_                  = get_parameter("output.crs").as_string();
+    input_gnss_crs_ = get_parameter("input.gnss_crs").as_string();
+    output_crs_ = get_parameter("output.crs").as_string();
     convert_to_enu_at_reference_ = get_parameter("output.convert_to_enu_at_reference").as_bool();
-    reference_use_first_fix_     = get_parameter("reference.use_first_fix").as_bool();
+    reference_use_first_fix_ = get_parameter("reference.use_first_fix").as_bool();
 
     init_proj();
 
@@ -356,91 +365,107 @@ public:
       gnss_ref_ecef_.z = get_parameter("reference.z").as_double();
       output_to_gnss(gnss_ref_ecef_, gnss_ref_lla_);
       gnss_ref_set_ = true;
-      RCLCPP_INFO(get_logger(),
+      RCLCPP_INFO(
+        get_logger(),
         "PROJ: fixed reference origin (%.3f, %.3f, %.3f) → lat=%.6f lon=%.6f alt=%.2f",
-        gnss_ref_ecef_.x, gnss_ref_ecef_.y, gnss_ref_ecef_.z,
-        gnss_ref_lla_.lat_rad * 180.0 / M_PI,
-        gnss_ref_lla_.lon_rad * 180.0 / M_PI,
-        gnss_ref_lla_.alt_m);
+        gnss_ref_ecef_.x, gnss_ref_ecef_.y, gnss_ref_ecef_.z, gnss_ref_lla_.lat_rad * 180.0 / M_PI,
+        gnss_ref_lla_.lon_rad * 180.0 / M_PI, gnss_ref_lla_.alt_m);
     } else {
       RCLCPP_INFO(get_logger(), "PROJ: using first GPS fix as local reference origin");
     }
 
-    config.outlier_rejection      = get_parameter("outlier_rejection").as_bool();
+    config.outlier_rejection = get_parameter("outlier_rejection").as_bool();
     config.outlier_threshold_gnss = get_parameter("outlier_threshold_gnss").as_double();
-    config.outlier_threshold_imu  = get_parameter("outlier_threshold_imu").as_double();
-    config.outlier_threshold_enc   = get_parameter("outlier_threshold_enc").as_double();
-    config.outlier_threshold_hdg   = get_parameter("outlier_threshold_hdg").as_double();
+    config.outlier_threshold_imu = get_parameter("outlier_threshold_imu").as_double();
+    config.outlier_threshold_enc = get_parameter("outlier_threshold_enc").as_double();
+    config.outlier_threshold_hdg = get_parameter("outlier_threshold_hdg").as_double();
     config.outlier_threshold_vslam = get_parameter("outlier_threshold_vslam").as_double();
 
-    vslam_topic_          = get_parameter("vslam.topic").as_string();
+    vslam_topic_ = get_parameter("vslam.topic").as_string();
     vslam_frame_override_ = get_parameter("vslam.frame_id").as_string();
-    config.vslam.position_noise    = get_parameter("vslam.position_noise").as_double();
+    config.vslam.position_noise = get_parameter("vslam.position_noise").as_double();
     config.vslam.orientation_noise = get_parameter("vslam.orientation_noise").as_double();
-    vslam_reinit_n_       = get_parameter("vslam.reinit_n").as_int();
+    vslam_reinit_n_ = get_parameter("vslam.reinit_n").as_int();
 
-    config.gnss_coast_n               = get_parameter("gnss.coast_n").as_int();
-    config.gnss_coast_q_factor        = get_parameter("gnss.coast_q_factor").as_double();
-    config.gnss_coast_timeout_s       = get_parameter("gnss.coast_timeout_s").as_double();
-    config.gnss_coast_q_bias_factor   = get_parameter("gnss.coast_q_bias_factor").as_double();
-    config.gnss_coast_imu_wz_scale    = get_parameter("gnss.coast_imu_wz_scale").as_double();
-    config.gnss_recovery_rejection_n  = get_parameter("gnss.recovery_rejection_n").as_int();
-    config.gnss_p_inflate_sigma       = get_parameter("gnss.p_inflate_sigma").as_double();
-    config.gnss_recovery_timeout_s    = get_parameter("gnss.recovery_timeout_s").as_double();
-    config.gps_track_heading_enabled   = get_parameter("gnss.track_heading_enabled").as_bool();
-    config.gps_track_heading_min_dist  = get_parameter("gnss.track_heading_min_dist").as_double();
+    config.gnss_coast_n = get_parameter("gnss.coast_n").as_int();
+    config.gnss_coast_q_factor = get_parameter("gnss.coast_q_factor").as_double();
+    config.gnss_coast_timeout_s = get_parameter("gnss.coast_timeout_s").as_double();
+    config.gnss_coast_q_bias_factor = get_parameter("gnss.coast_q_bias_factor").as_double();
+    config.gnss_coast_imu_wz_scale = get_parameter("gnss.coast_imu_wz_scale").as_double();
+    config.gnss_recovery_rejection_n = get_parameter("gnss.recovery_rejection_n").as_int();
+    config.gnss_p_inflate_sigma = get_parameter("gnss.p_inflate_sigma").as_double();
+    config.gnss_recovery_timeout_s = get_parameter("gnss.recovery_timeout_s").as_double();
+    config.gps_track_heading_enabled = get_parameter("gnss.track_heading_enabled").as_bool();
+    config.gps_track_heading_min_dist = get_parameter("gnss.track_heading_min_dist").as_double();
     config.gps_track_heading_max_sigma = get_parameter("gnss.track_heading_max_sigma").as_double();
     config.gps_track_heading_min_speed = get_parameter("gnss.track_heading_min_speed").as_double();
-    config.gps_track_heading_max_yaw_rate = get_parameter("gnss.track_heading_max_yaw_rate").as_double();
-    config.heading_observable_distance = get_parameter("gnss.heading_observable_distance").as_double();
+    config.gps_track_heading_max_yaw_rate =
+      get_parameter("gnss.track_heading_max_yaw_rate").as_double();
+    config.heading_observable_distance =
+      get_parameter("gnss.heading_observable_distance").as_double();
+    config.gps_rotation_heading_enabled = get_parameter("gnss.rotation_heading_enabled").as_bool();
+    config.gps_rotation_heading_min_yaw_delta =
+      get_parameter("gnss.rotation_heading_min_yaw_delta").as_double();
+    config.gps_rotation_heading_min_arc_baseline =
+      get_parameter("gnss.rotation_heading_min_arc_baseline").as_double();
+    config.gps_rotation_heading_max_base_translation =
+      get_parameter("gnss.rotation_heading_max_base_translation").as_double();
+    config.gps_rotation_heading_max_sigma =
+      get_parameter("gnss.rotation_heading_max_sigma").as_double();
+    config.gps_rotation_heading_sigma_floor =
+      get_parameter("gnss.rotation_heading_sigma_floor").as_double();
+    config.gps_rotation_heading_delta_yaw_sigma =
+      get_parameter("gnss.rotation_heading_delta_yaw_sigma").as_double();
+    config.gps_rotation_heading_max_window_s =
+      get_parameter("gnss.rotation_heading_max_window_s").as_double();
 
-    config.adaptive_imu     = get_parameter("adaptive.imu").as_bool();
+    config.adaptive_imu = get_parameter("adaptive.imu").as_bool();
     config.adaptive_encoder = get_parameter("adaptive.encoder").as_bool();
-    config.adaptive_gnss    = get_parameter("adaptive.gnss").as_bool();
-    config.adaptive_window  = get_parameter("adaptive.window").as_int();
-    config.adaptive_alpha   = get_parameter("adaptive.alpha").as_double();
+    config.adaptive_gnss = get_parameter("adaptive.gnss").as_bool();
+    config.adaptive_window = get_parameter("adaptive.window").as_int();
+    config.adaptive_alpha = get_parameter("adaptive.alpha").as_double();
 
-    config.ukf.q_position   = get_parameter("ukf.q_position").as_double();
-    config.ukf.q_orientation  = get_parameter("ukf.q_orientation").as_double();
+    config.ukf.q_position = get_parameter("ukf.q_position").as_double();
+    config.ukf.q_orientation = get_parameter("ukf.q_orientation").as_double();
     if (config.ukf.q_orientation > 1e-3) {
-      RCLCPP_ERROR(get_logger(),
+      RCLCPP_ERROR(
+        get_logger(),
         "ukf.q_orientation=%.2e is too large: quaternion math will corrupt at IMU rates. "
         "Set to 1.0e-9 or remove the line from your config (default is 1.0e-9).",
         config.ukf.q_orientation);
       return CallbackReturn::FAILURE;
     }
-    config.ukf.q_velocity     = get_parameter("ukf.q_velocity").as_double();
-    config.ukf.q_angular_vel  = get_parameter("ukf.q_angular_vel").as_double();
+    config.ukf.q_velocity = get_parameter("ukf.q_velocity").as_double();
+    config.ukf.q_angular_vel = get_parameter("ukf.q_angular_vel").as_double();
     config.ukf.q_acceleration = get_parameter("ukf.q_acceleration").as_double();
-    config.ukf.q_gyro_bias          = get_parameter("ukf.q_gyro_bias").as_double();
-    config.ukf.q_accel_bias         = get_parameter("ukf.q_accel_bias").as_double();
-    config.ukf.q_encoder_wz_bias    = get_parameter("ukf.q_encoder_wz_bias").as_double();
+    config.ukf.q_gyro_bias = get_parameter("ukf.q_gyro_bias").as_double();
+    config.ukf.q_accel_bias = get_parameter("ukf.q_accel_bias").as_double();
+    config.ukf.q_encoder_wz_bias = get_parameter("ukf.q_encoder_wz_bias").as_double();
 
-    zupt_enabled_            = get_parameter("zupt.enabled").as_bool();
+    zupt_enabled_ = get_parameter("zupt.enabled").as_bool();
     zupt_velocity_threshold_ = get_parameter("zupt.velocity_threshold").as_double();
-    zupt_angular_threshold_  = get_parameter("zupt.angular_threshold").as_double();
-    zupt_noise_sigma_        = get_parameter("zupt.noise_sigma").as_double();
+    zupt_angular_threshold_ = get_parameter("zupt.angular_threshold").as_double();
+    zupt_noise_sigma_ = get_parameter("zupt.noise_sigma").as_double();
 
-    config.ground_z_position_sigma = get_parameter("ground_constraint.z_position_sigma").as_double();
+    config.ground_z_position_sigma =
+      get_parameter("ground_constraint.z_position_sigma").as_double();
 
-    init_window_duration_    = get_parameter("init.stationary_window").as_double();
-    wait_for_all_sensors_    = get_parameter("init.wait_for_all_sensors").as_bool();
-    sensor_wait_timeout_     = get_parameter("init.sensor_wait_timeout").as_double();
-    checkpoint_path_         = get_parameter("replay.checkpoint_path").as_string();
+    init_window_duration_ = get_parameter("init.stationary_window").as_double();
+    wait_for_all_sensors_ = get_parameter("init.wait_for_all_sensors").as_bool();
+    sensor_wait_timeout_ = get_parameter("init.sensor_wait_timeout").as_double();
+    checkpoint_path_ = get_parameter("replay.checkpoint_path").as_string();
 
-    const std::string motion_model_name =
-      get_parameter("motion_model").as_string();
-    const double wheelbase =
-      get_parameter("motion_model_params.wheelbase").as_double();
+    const std::string motion_model_name = get_parameter("motion_model").as_string();
+    const double wheelbase = get_parameter("motion_model_params.wheelbase").as_double();
 
-    if (!motion_model_name.empty() &&
-        motion_model_name != "ConstantVelocityAcceleration" &&
-        motion_model_name != "CVA") {
+    if (
+      !motion_model_name.empty() && motion_model_name != "ConstantVelocityAcceleration" &&
+      motion_model_name != "CVA") {
       try {
-        config.motion_model = fusioncore::create_motion_model(
-          motion_model_name, {{"wheelbase", wheelbase}});
+        config.motion_model =
+          fusioncore::create_motion_model(motion_model_name, {{"wheelbase", wheelbase}});
         RCLCPP_INFO(get_logger(), "Motion model: %s", motion_model_name.c_str());
-      } catch (const std::exception& e) {
+      } catch (const std::exception & e) {
         RCLCPP_ERROR(get_logger(), "%s", e.what());
         return CallbackReturn::FAILURE;
       }
@@ -453,14 +478,14 @@ public:
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
     if (!heading_topic_.empty()) {
-      RCLCPP_INFO(get_logger(),
-        "Dual antenna heading enabled on topic: %s", heading_topic_.c_str());
+      RCLCPP_INFO(
+        get_logger(), "Dual antenna heading enabled on topic: %s", heading_topic_.c_str());
     } else {
       RCLCPP_INFO(get_logger(), "Dual antenna heading disabled.");
     }
 
-    RCLCPP_INFO(get_logger(),
-      "FusionCore configured. base_frame=%s odom_frame=%s rate=%.0fHz",
+    RCLCPP_INFO(
+      get_logger(), "FusionCore configured. base_frame=%s odom_frame=%s rate=%.0fHz",
       base_frame_.c_str(), odom_frame_.c_str(), publish_rate_);
 
     return CallbackReturn::SUCCESS;
@@ -488,7 +513,8 @@ public:
       [this](const sensor_msgs::msg::Imu::SharedPtr msg) {
         std::lock_guard<std::mutex> lock(fc_mutex_);
         imu_callback(msg);
-      }, sensor_opts);
+      },
+      sensor_opts);
     RCLCPP_INFO(get_logger(), "IMU topic: %s", imu_topic_.c_str());
 
     if (!imu2_topic_.empty()) {
@@ -497,9 +523,9 @@ public:
         [this](const sensor_msgs::msg::Imu::SharedPtr msg) {
           std::lock_guard<std::mutex> lock(fc_mutex_);
           imu2_callback(msg);
-        }, sensor_opts);
-      RCLCPP_INFO(get_logger(),
-        "Second IMU enabled on topic: %s", imu2_topic_.c_str());
+        },
+        sensor_opts);
+      RCLCPP_INFO(get_logger(), "Second IMU enabled on topic: %s", imu2_topic_.c_str());
     }
 
     encoder_sub_ = create_subscription<nav_msgs::msg::Odometry>(
@@ -507,7 +533,8 @@ public:
       [this](const nav_msgs::msg::Odometry::SharedPtr msg) {
         std::lock_guard<std::mutex> lock(fc_mutex_);
         encoder_callback(msg);
-      }, sensor_opts);
+      },
+      sensor_opts);
 
     // Second encoder-twist source (e.g. KISS-ICP LiDAR odometry). Created
     // lazily only when encoder2.topic is non-empty to keep the default
@@ -518,9 +545,10 @@ public:
         [this](const nav_msgs::msg::Odometry::SharedPtr msg) {
           std::lock_guard<std::mutex> lock(fc_mutex_);
           encoder2_callback(msg);
-        }, sensor_opts);
-      RCLCPP_INFO(get_logger(),
-        "Second encoder-twist source enabled on topic: %s", encoder2_topic_.c_str());
+        },
+        sensor_opts);
+      RCLCPP_INFO(
+        get_logger(), "Second encoder-twist source enabled on topic: %s", encoder2_topic_.c_str());
     }
 
     if (!vslam_topic_.empty()) {
@@ -529,9 +557,9 @@ public:
         [this](const nav_msgs::msg::Odometry::SharedPtr msg) {
           std::lock_guard<std::mutex> lock(fc_mutex_);
           vslam_callback(msg);
-        }, sensor_opts);
-      RCLCPP_INFO(get_logger(),
-        "VSLAM pose fusion enabled on topic: %s", vslam_topic_.c_str());
+        },
+        sensor_opts);
+      RCLCPP_INFO(get_logger(), "VSLAM pose fusion enabled on topic: %s", vslam_topic_.c_str());
     }
 
     if (!gnss_vel_topic_.empty()) {
@@ -540,9 +568,10 @@ public:
         [this](const nav_msgs::msg::Odometry::SharedPtr msg) {
           std::lock_guard<std::mutex> lock(fc_mutex_);
           gnss_vel_callback(msg);
-        }, sensor_opts);
-      RCLCPP_INFO(get_logger(),
-        "GPS velocity fusion enabled on topic: %s", gnss_vel_topic_.c_str());
+        },
+        sensor_opts);
+      RCLCPP_INFO(
+        get_logger(), "GPS velocity fusion enabled on topic: %s", gnss_vel_topic_.c_str());
     }
 
     if (!radar_vel_topic_.empty()) {
@@ -551,9 +580,11 @@ public:
         [this](const nav_msgs::msg::Odometry::SharedPtr msg) {
           std::lock_guard<std::mutex> lock(fc_mutex_);
           radar_vel_callback(msg);
-        }, sensor_opts);
-      RCLCPP_INFO(get_logger(),
-        "Radar Doppler velocity fusion enabled on topic: %s", radar_vel_topic_.c_str());
+        },
+        sensor_opts);
+      RCLCPP_INFO(
+        get_logger(), "Radar Doppler velocity fusion enabled on topic: %s",
+        radar_vel_topic_.c_str());
     }
 
     if (use_gps_fix_) {
@@ -562,16 +593,17 @@ public:
         [this](const gps_msgs::msg::GPSFix::SharedPtr msg) {
           std::lock_guard<std::mutex> lock(fc_mutex_);
           gps_fix_callback(msg, 0);
-        }, sensor_opts);
-      RCLCPP_INFO(get_logger(),
-        "GNSS: using gps_msgs/GPSFix on /gnss/fix (RTK_FLOAT capable)");
+        },
+        sensor_opts);
+      RCLCPP_INFO(get_logger(), "GNSS: using gps_msgs/GPSFix on /gnss/fix (RTK_FLOAT capable)");
     } else {
       gnss_sub_ = create_subscription<sensor_msgs::msg::NavSatFix>(
         "/gnss/fix", 10,
         [this](const sensor_msgs::msg::NavSatFix::SharedPtr msg) {
           std::lock_guard<std::mutex> lock(fc_mutex_);
           gnss_callback(msg, 0);
-        }, sensor_opts);
+        },
+        sensor_opts);
     }
 
     // compass_msgs/Azimuth heading: optional, preferred over sensor_msgs/Imu
@@ -581,9 +613,10 @@ public:
         [this](const compass_msgs::msg::Azimuth::SharedPtr msg) {
           std::lock_guard<std::mutex> lock(fc_mutex_);
           azimuth_callback(msg);
-        }, sensor_opts);
-      RCLCPP_INFO(get_logger(),
-        "compass_msgs/Azimuth heading enabled on topic: %s", azimuth_topic_.c_str());
+        },
+        sensor_opts);
+      RCLCPP_INFO(
+        get_logger(), "compass_msgs/Azimuth heading enabled on topic: %s", azimuth_topic_.c_str());
     }
 
     // Second GNSS receiver: optional
@@ -593,9 +626,9 @@ public:
         [this](const sensor_msgs::msg::NavSatFix::SharedPtr msg) {
           std::lock_guard<std::mutex> lock(fc_mutex_);
           gnss_callback(msg, 1);
-        }, sensor_opts);
-      RCLCPP_INFO(get_logger(),
-        "Second GNSS receiver enabled on topic: %s", gnss2_topic_.c_str());
+        },
+        sensor_opts);
+      RCLCPP_INFO(get_logger(), "Second GNSS receiver enabled on topic: %s", gnss2_topic_.c_str());
     }
 
     // Dual antenna heading subscriber: only if topic is configured
@@ -607,42 +640,38 @@ public:
         [this](const sensor_msgs::msg::Imu::SharedPtr msg) {
           std::lock_guard<std::mutex> lock(fc_mutex_);
           gnss_heading_callback(msg);
-        }, sensor_opts);
-      RCLCPP_INFO(get_logger(),
-        "Subscribed to dual antenna heading: %s", heading_topic_.c_str());
+        },
+        sensor_opts);
+      RCLCPP_INFO(get_logger(), "Subscribed to dual antenna heading: %s", heading_topic_.c_str());
     }
 
-    odom_pub_  = create_publisher<nav_msgs::msg::Odometry>("/fusion/odom", 100);
-    pose_pub_  = create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>("/fusion/pose", 100);
-    diag_pub_  = create_publisher<diagnostic_msgs::msg::DiagnosticArray>("/diagnostics", 10);
+    odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("/fusion/odom", 100);
+    pose_pub_ =
+      create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>("/fusion/pose", 100);
+    diag_pub_ = create_publisher<diagnostic_msgs::msg::DiagnosticArray>("/diagnostics", 10);
 
     auto period = std::chrono::duration<double>(1.0 / publish_rate_);
     publish_timer_ = create_wall_timer(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(period),
-      [this]() { publish_state(); },
+      std::chrono::duration_cast<std::chrono::nanoseconds>(period), [this]() { publish_state(); },
       publish_cb_group_);
 
     // Diagnostics at 1 Hz: standard ROS convention
     diag_timer_ = create_wall_timer(
-      std::chrono::seconds(1),
-      [this]() { publish_diagnostics(); },
-      publish_cb_group_);
+      std::chrono::seconds(1), [this]() { publish_diagnostics(); }, publish_cb_group_);
 
     // Reset service: re-initializes the filter without restarting the node.
     // Useful after GPS jumps, teleportation in simulation, or catastrophic drift.
     reset_srv_ = create_service<std_srvs::srv::Trigger>(
-      "~/reset",
-      [this](
-        const std_srvs::srv::Trigger::Request::SharedPtr,
-        std_srvs::srv::Trigger::Response::SharedPtr response)
-      {
+      "~/reset", [this](
+                   const std_srvs::srv::Trigger::Request::SharedPtr,
+                   std_srvs::srv::Trigger::Response::SharedPtr response) {
         std::lock_guard<std::mutex> lock(fc_mutex_);
         fusioncore::State initial;
         initial.x = fusioncore::StateVector::Zero();
         initial.P = fusioncore::StateMatrix::Identity() * 0.1;
-        initial.P(0,0) = 1000.0;
-        initial.P(1,1) = 1000.0;
-        initial.P(2,2) = 1000.0;
+        initial.P(0, 0) = 1000.0;
+        initial.P(1, 1) = 1000.0;
+        initial.P(2, 2) = 1000.0;
         fc_->init(initial, last_imu_time_);
         gnss_ref_set_ = false;  // re-anchor GPS reference on next fix
         response->success = true;
@@ -654,14 +683,13 @@ public:
     // Drop-in replacement for robot_localization's /fromLL service used by
     // nav2_waypoint_follower for GPS waypoint navigation.
     from_ll_srv_ = create_service<fusioncore_ros::srv::FromLL>(
-      "/fromLL",
-      [this](
-        const fusioncore_ros::srv::FromLL::Request::SharedPtr request,
-        fusioncore_ros::srv::FromLL::Response::SharedPtr response)
-      {
+      "/fromLL", [this](
+                   const fusioncore_ros::srv::FromLL::Request::SharedPtr request,
+                   fusioncore_ros::srv::FromLL::Response::SharedPtr response) {
         std::lock_guard<std::mutex> lock(fc_mutex_);
         if (!gnss_ref_set_) {
-          RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+          RCLCPP_WARN_THROTTLE(
+            get_logger(), *get_clock(), 5000,
             "fromLL called before GPS reference is set. "
             "Wait for a GPS fix before requesting waypoint conversion.");
           response->map_point.x = 0.0;
@@ -670,18 +698,17 @@ public:
           return;
         }
         fusioncore::sensors::LLAPoint lla;
-        lla.lat_rad = request->ll_point.latitude  * M_PI / 180.0;
+        lla.lat_rad = request->ll_point.latitude * M_PI / 180.0;
         lla.lon_rad = request->ll_point.longitude * M_PI / 180.0;
-        lla.alt_m   = request->ll_point.altitude;
+        lla.alt_m = request->ll_point.altitude;
         fusioncore::sensors::ECEFPoint ecef;
         gnss_to_output(lla, ecef);
         Eigen::Vector3d enu;
         if (convert_to_enu_at_reference_) {
           enu = fusioncore::sensors::ecef_to_enu(ecef, gnss_ref_ecef_, gnss_ref_lla_);
         } else {
-          enu = Eigen::Vector3d(ecef.x - gnss_ref_ecef_.x,
-                                ecef.y - gnss_ref_ecef_.y,
-                                ecef.z - gnss_ref_ecef_.z);
+          enu = Eigen::Vector3d(
+            ecef.x - gnss_ref_ecef_.x, ecef.y - gnss_ref_ecef_.y, ecef.z - gnss_ref_ecef_.z);
         }
         response->map_point.x = enu[0];
         response->map_point.y = enu[1];
@@ -690,10 +717,9 @@ public:
 
     // Checkpoint services: save/load full filter state for deterministic replay.
     save_checkpoint_srv_ = create_service<std_srvs::srv::Trigger>(
-      "~/save_checkpoint",
-      [this](const std_srvs::srv::Trigger::Request::SharedPtr,
-             std_srvs::srv::Trigger::Response::SharedPtr response)
-      {
+      "~/save_checkpoint", [this](
+                             const std_srvs::srv::Trigger::Request::SharedPtr,
+                             std_srvs::srv::Trigger::Response::SharedPtr response) {
         std::lock_guard<std::mutex> lock(fc_mutex_);
         if (!fc_->is_initialized()) {
           response->success = false;
@@ -706,7 +732,7 @@ public:
           response->message = "Cannot open: " + checkpoint_path_;
           return;
         }
-        const auto& s = fc_->get_state();
+        const auto & s = fc_->get_state();
         f << "t=" << last_imu_time_ << "\n";
         f << "x=";
         for (int i = 0; i < fusioncore::STATE_DIM; ++i)
@@ -714,19 +740,19 @@ public:
         f << "P=";
         for (int r = 0; r < fusioncore::STATE_DIM; ++r)
           for (int c = 0; c < fusioncore::STATE_DIM; ++c)
-            f << s.P(r, c) <<
-              (r == fusioncore::STATE_DIM - 1 && c == fusioncore::STATE_DIM - 1 ? "\n" : " ");
+            f << s.P(r, c)
+              << (r == fusioncore::STATE_DIM - 1 && c == fusioncore::STATE_DIM - 1 ? "\n" : " ");
         response->success = true;
         response->message = "Saved to " + checkpoint_path_;
-        RCLCPP_INFO(get_logger(), "State checkpoint saved to %s at t=%.3f",
-          checkpoint_path_.c_str(), last_imu_time_);
+        RCLCPP_INFO(
+          get_logger(), "State checkpoint saved to %s at t=%.3f", checkpoint_path_.c_str(),
+          last_imu_time_);
       });
 
     load_checkpoint_srv_ = create_service<std_srvs::srv::Trigger>(
-      "~/load_checkpoint",
-      [this](const std_srvs::srv::Trigger::Request::SharedPtr,
-             std_srvs::srv::Trigger::Response::SharedPtr response)
-      {
+      "~/load_checkpoint", [this](
+                             const std_srvs::srv::Trigger::Request::SharedPtr,
+                             std_srvs::srv::Trigger::Response::SharedPtr response) {
         std::lock_guard<std::mutex> lock(fc_mutex_);
         std::ifstream f(checkpoint_path_);
         if (!f) {
@@ -746,15 +772,14 @@ public:
           } else if (line.substr(0, 2) == "P=") {
             std::istringstream ss(line.substr(2));
             for (int r = 0; r < fusioncore::STATE_DIM; ++r)
-              for (int c = 0; c < fusioncore::STATE_DIM; ++c)
-                ss >> restored.P(r, c);
+              for (int c = 0; c < fusioncore::STATE_DIM; ++c) ss >> restored.P(r, c);
           }
         }
         fc_->init(restored, t);
         response->success = true;
         response->message = "Loaded from " + checkpoint_path_;
-        RCLCPP_INFO(get_logger(), "State checkpoint loaded from %s at t=%.3f",
-          checkpoint_path_.c_str(), t);
+        RCLCPP_INFO(
+          get_logger(), "State checkpoint loaded from %s at t=%.3f", checkpoint_path_.c_str(), t);
       });
 
     // Sensor wait: populate the expected set based on configured sources.
@@ -764,17 +789,17 @@ public:
       sensor_wait_done_ = false;
       sensors_expected_.insert("IMU");
       sensors_expected_.insert("Encoder");
-      if (reference_use_first_fix_)        sensors_expected_.insert("GNSS");
-      if (!imu2_topic_.empty())            sensors_expected_.insert("IMU2");
-      if (!encoder2_topic_.empty())        sensors_expected_.insert("Encoder2");
-      if (!vslam_topic_.empty())           sensors_expected_.insert("VSLAM");
-      if (!gnss_vel_topic_.empty())        sensors_expected_.insert("GPSVel");
-      if (!radar_vel_topic_.empty())       sensors_expected_.insert("RadarVel");
-      if (!heading_topic_.empty() ||
-          !azimuth_topic_.empty())         sensors_expected_.insert("Heading");
-      if (!gnss2_topic_.empty())           sensors_expected_.insert("GNSS2");
+      if (reference_use_first_fix_) sensors_expected_.insert("GNSS");
+      if (!imu2_topic_.empty()) sensors_expected_.insert("IMU2");
+      if (!encoder2_topic_.empty()) sensors_expected_.insert("Encoder2");
+      if (!vslam_topic_.empty()) sensors_expected_.insert("VSLAM");
+      if (!gnss_vel_topic_.empty()) sensors_expected_.insert("GPSVel");
+      if (!radar_vel_topic_.empty()) sensors_expected_.insert("RadarVel");
+      if (!heading_topic_.empty() || !azimuth_topic_.empty()) sensors_expected_.insert("Heading");
+      if (!gnss2_topic_.empty()) sensors_expected_.insert("GNSS2");
       activate_time_ = this->now().seconds();
-      RCLCPP_INFO(get_logger(), "Waiting for %zu sensor(s) before starting filter.",
+      RCLCPP_INFO(
+        get_logger(), "Waiting for %zu sensor(s) before starting filter.",
         sensors_expected_.size());
     }
 
@@ -791,7 +816,7 @@ public:
     encoder_sub_.reset();
     encoder2_sub_.reset();
     vslam_sub_.reset();
-    vslam_origin_set_          = false;
+    vslam_origin_set_ = false;
     vslam_consecutive_rejects_ = 0;
     gnss_vel_sub_.reset();
     radar_vel_sub_.reset();
@@ -826,19 +851,15 @@ public:
     return CallbackReturn::SUCCESS;
   }
 
-  CallbackReturn on_shutdown(const rclcpp_lifecycle::State &)
-  {
-    return CallbackReturn::SUCCESS;
-  }
+  CallbackReturn on_shutdown(const rclcpp_lifecycle::State &) { return CallbackReturn::SUCCESS; }
 
 private:
-
   // ─── TF validation ────────────────────────────────────────────────────────
   // Called during on_configure. Checks all required transforms exist.
   // Prints [OK] or [MISSING] + exact fix command for each.
   // Returns true only if all critical transforms are found.
 
-    bool validate_transforms()
+  bool validate_transforms()
   {
     bool all_ok = true;
     RCLCPP_INFO(get_logger(), "--- TF Validation ---");
@@ -850,15 +871,18 @@ private:
     // Note: base_frame_ → odom_frame_ is intentionally NOT checked here.
     // FusionCore itself publishes that TF, so it cannot exist before the filter
     // starts: checking it would always produce a misleading MISSING warning.
-    std::vector<std::pair<std::string,std::string>> to_check = {
+    std::vector<std::pair<std::string, std::string>> to_check = {
       {imu_tf_frame, base_frame_},
     };
 
-    for (const auto& [from, to] : to_check) {
+    for (const auto & [from, to] : to_check) {
       if (check_transform(from, to)) {
         RCLCPP_INFO(get_logger(), "  [OK]      %s -> %s", from.c_str(), to.c_str());
       } else {
-        RCLCPP_WARN(get_logger(), "  [MISSING] %s -> %s  Fix: ros2 run tf2_ros static_transform_publisher --frame-id %s --child-frame-id %s",
+        RCLCPP_WARN(
+          get_logger(),
+          "  [MISSING] %s -> %s  Fix: ros2 run tf2_ros static_transform_publisher --frame-id %s "
+          "--child-frame-id %s",
           from.c_str(), to.c_str(), to.c_str(), from.c_str());
         all_ok = false;
       }
@@ -869,10 +893,11 @@ private:
       if (check_transform("gnss_link", base_frame_)) {
         RCLCPP_INFO(get_logger(), "  [OK]      gnss_link -> %s", base_frame_.c_str());
       } else {
-        RCLCPP_WARN(get_logger(),
-          "  [MISSING] gnss_link -> %s  Fix: ros2 run tf2_ros static_transform_publisher --x %.3f --y %.3f --z %.3f --frame-id %s --child-frame-id gnss_link",
-          base_frame_.c_str(),
-          gnss_lever_arm_.x, gnss_lever_arm_.y, gnss_lever_arm_.z,
+        RCLCPP_WARN(
+          get_logger(),
+          "  [MISSING] gnss_link -> %s  Fix: ros2 run tf2_ros static_transform_publisher --x %.3f "
+          "--y %.3f --z %.3f --frame-id %s --child-frame-id gnss_link",
+          base_frame_.c_str(), gnss_lever_arm_.x, gnss_lever_arm_.y, gnss_lever_arm_.z,
           base_frame_.c_str());
         all_ok = false;
       }
@@ -883,10 +908,11 @@ private:
       if (check_transform("gnss2_link", base_frame_)) {
         RCLCPP_INFO(get_logger(), "  [OK]      gnss2_link -> %s", base_frame_.c_str());
       } else {
-        RCLCPP_WARN(get_logger(),
-          "  [MISSING] gnss2_link -> %s  Fix: ros2 run tf2_ros static_transform_publisher --x %.3f --y %.3f --z %.3f --frame-id %s --child-frame-id gnss2_link",
-          base_frame_.c_str(),
-          gnss_lever_arm2_.x, gnss_lever_arm2_.y, gnss_lever_arm2_.z,
+        RCLCPP_WARN(
+          get_logger(),
+          "  [MISSING] gnss2_link -> %s  Fix: ros2 run tf2_ros static_transform_publisher --x %.3f "
+          "--y %.3f --z %.3f --frame-id %s --child-frame-id gnss2_link",
+          base_frame_.c_str(), gnss_lever_arm2_.x, gnss_lever_arm2_.y, gnss_lever_arm2_.z,
           base_frame_.c_str());
         all_ok = false;
       }
@@ -896,19 +922,14 @@ private:
     return all_ok;
   }
 
-
   bool check_transform(
-    const std::string& from_frame,
-    const std::string& to_frame,
-    double timeout_seconds = 1.0)
+    const std::string & from_frame, const std::string & to_frame, double timeout_seconds = 1.0)
   {
     try {
       tf_buffer_->lookupTransform(
-        to_frame, from_frame,
-        tf2::TimePointZero,
-        tf2::durationFromSec(timeout_seconds));
+        to_frame, from_frame, tf2::TimePointZero, tf2::durationFromSec(timeout_seconds));
       return true;
-    } catch (const tf2::TransformException&) {
+    } catch (const tf2::TransformException &) {
       return false;
     }
   }
@@ -916,15 +937,19 @@ private:
   // ─── IMU callback: with frame transform ──────────────────────────────────
 
   // Helper: mark a sensor as received for the sensor-wait feature.
-  void mark_sensor_received(const std::string& name) {
-    if (wait_for_all_sensors_ && sensors_expected_.count(name))
-      sensors_received_.insert(name);
+  void mark_sensor_received(const std::string & name)
+  {
+    if (wait_for_all_sensors_ && sensors_expected_.count(name)) sensors_received_.insert(name);
   }
 
   // Helper: format a set of sensor names as "A, B, C" for log messages.
-  static std::string format_sensor_set(const std::set<std::string>& s) {
+  static std::string format_sensor_set(const std::set<std::string> & s)
+  {
     std::string out;
-    for (const auto& n : s) { if (!out.empty()) out += ", "; out += n; }
+    for (const auto & n : s) {
+      if (!out.empty()) out += ", ";
+      out += n;
+    }
     return out;
   }
 
@@ -945,22 +970,22 @@ private:
           double elapsed = this->now().seconds() - activate_time_;
           if (elapsed < sensor_wait_timeout_) {
             std::set<std::string> missing;
-            for (const auto& s : sensors_expected_)
+            for (const auto & s : sensors_expected_)
               if (!sensors_received_.count(s)) missing.insert(s);
-            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
-              "Waiting for sensors (%.1fs / %.1fs): missing [%s]",
+            RCLCPP_INFO_THROTTLE(
+              get_logger(), *get_clock(), 2000, "Waiting for sensors (%.1fs / %.1fs): missing [%s]",
               elapsed, sensor_wait_timeout_, format_sensor_set(missing).c_str());
             return;
           }
           std::set<std::string> missing;
-          for (const auto& s : sensors_expected_)
+          for (const auto & s : sensors_expected_)
             if (!sensors_received_.count(s)) missing.insert(s);
-          RCLCPP_WARN(get_logger(),
-            "Sensor wait timed out after %.1fs. Missing: [%s]. Starting anyway.",
+          RCLCPP_WARN(
+            get_logger(), "Sensor wait timed out after %.1fs. Missing: [%s]. Starting anyway.",
             sensor_wait_timeout_, format_sensor_set(missing).c_str());
         } else {
-          RCLCPP_INFO(get_logger(),
-            "All %zu configured sensors ready. Starting filter.",
+          RCLCPP_INFO(
+            get_logger(), "All %zu configured sensors ready. Starting filter.",
             sensors_expected_.size());
         }
         sensor_wait_done_ = true;
@@ -969,9 +994,9 @@ private:
       if (init_window_duration_ <= 0.0) {
         fusioncore::State initial;
         initial.P = fusioncore::StateMatrix::Identity() * 0.1;
-        initial.P(0,0) = 1000.0;
-        initial.P(1,1) = 1000.0;
-        initial.P(2,2) = 1000.0;
+        initial.P(0, 0) = 1000.0;
+        initial.P(1, 1) = 1000.0;
+        initial.P(2, 2) = 1000.0;
         fc_->init(initial, t);
         pending_init_ = false;
         RCLCPP_INFO(get_logger(), "Filter initialized at t=%.3f (first IMU)", t);
@@ -983,16 +1008,15 @@ private:
           // during bag replay with use_sim_time:true. Fall back to wall clock only for
           // drivers that publish zero-stamped messages (the original bug fix path).
           init_window_start_is_msg_time_ = (t > 0.0);
-          init_window_start_ = init_window_start_is_msg_time_
-            ? t : this->now().seconds();
-          init_window_aborted_    = false;
-          init_win_n_             = 0;
+          init_window_start_ = init_window_start_is_msg_time_ ? t : this->now().seconds();
+          init_window_aborted_ = false;
+          init_win_n_ = 0;
           init_win_wx_ = init_win_wy_ = init_win_wz_ = 0.0;
           init_win_ax_ = init_win_ay_ = init_win_az_ = 0.0;
           init_win_qw_ = init_win_qx_ = init_win_qy_ = init_win_qz_ = 0.0;
           init_win_orient_n_ = 0;
-          RCLCPP_INFO(get_logger(),
-            "Collecting %.1fs bias window before init...", init_window_duration_);
+          RCLCPP_INFO(
+            get_logger(), "Collecting %.1fs bias window before init...", init_window_duration_);
         }
 
         // Accumulate gyro and accel
@@ -1005,7 +1029,7 @@ private:
         ++init_win_n_;
 
         // Accumulate orientation if available
-        const auto& ocov = msg->orientation_covariance;
+        const auto & ocov = msg->orientation_covariance;
         bool has_orient = (ocov[0] > 0.0 || ocov[4] > 0.0 || ocov[8] > 0.0);
         if (has_orient) {
           init_win_qw_ += msg->orientation.w;
@@ -1017,14 +1041,14 @@ private:
 
         // Window complete? Use same time source that was chosen at window start.
         double window_elapsed = init_window_start_is_msg_time_
-          ? (t - init_window_start_)
-          : (this->now().seconds() - init_window_start_);
+                                  ? (t - init_window_start_)
+                                  : (this->now().seconds() - init_window_start_);
         if (window_elapsed >= init_window_duration_) {
           fusioncore::State initial;
           initial.P = fusioncore::StateMatrix::Identity() * 0.1;
-          initial.P(0,0) = 1000.0;
-          initial.P(1,1) = 1000.0;
-          initial.P(2,2) = 1000.0;
+          initial.P(0, 0) = 1000.0;
+          initial.P(1, 1) = 1000.0;
+          initial.P(2, 2) = 1000.0;
 
           if (!init_window_aborted_ && init_win_n_ > 0) {
             double n = static_cast<double>(init_win_n_);
@@ -1036,31 +1060,37 @@ private:
               double on = static_cast<double>(init_win_orient_n_);
               double qw = init_win_qw_ / on, qx = init_win_qx_ / on;
               double qy = init_win_qy_ / on, qz = init_win_qz_ / on;
-              double norm = std::sqrt(qw*qw + qx*qx + qy*qy + qz*qz);
-              qw /= norm; qx /= norm; qy /= norm; qz /= norm;
+              double norm = std::sqrt(qw * qw + qx * qx + qy * qy + qz * qz);
+              qw /= norm;
+              qx /= norm;
+              qy /= norm;
+              qz /= norm;
               const double g = 9.80665;
-              double gx = 2.0*(qx*qz - qy*qw)*g;
-              double gy = 2.0*(qy*qz + qx*qw)*g;
-              double gz = (1.0 - 2.0*(qx*qx + qy*qy))*g;
+              double gx = 2.0 * (qx * qz - qy * qw) * g;
+              double gy = 2.0 * (qy * qz + qx * qw) * g;
+              double gz = (1.0 - 2.0 * (qx * qx + qy * qy)) * g;
               initial.x[fusioncore::B_AX] = init_win_ax_ / n - gx;
               initial.x[fusioncore::B_AY] = init_win_ay_ / n - gy;
               initial.x[fusioncore::B_AZ] = init_win_az_ / n - gz;
-              RCLCPP_INFO(get_logger(),
+              RCLCPP_INFO(
+                get_logger(),
                 "Bias window done: gyro=[%.4f,%.4f,%.4f] accel=[%.4f,%.4f,%.4f] rad/s, m/s²",
-                initial.x[fusioncore::B_GX], initial.x[fusioncore::B_GY], initial.x[fusioncore::B_GZ],
-                initial.x[fusioncore::B_AX], initial.x[fusioncore::B_AY], initial.x[fusioncore::B_AZ]);
+                initial.x[fusioncore::B_GX], initial.x[fusioncore::B_GY],
+                initial.x[fusioncore::B_GZ], initial.x[fusioncore::B_AX],
+                initial.x[fusioncore::B_AY], initial.x[fusioncore::B_AZ]);
             } else {
-              RCLCPP_INFO(get_logger(),
-                "Bias window done (gyro only, no orientation): gyro=[%.4f,%.4f,%.4f]",
-                initial.x[fusioncore::B_GX], initial.x[fusioncore::B_GY], initial.x[fusioncore::B_GZ]);
+              RCLCPP_INFO(
+                get_logger(), "Bias window done (gyro only, no orientation): gyro=[%.4f,%.4f,%.4f]",
+                initial.x[fusioncore::B_GX], initial.x[fusioncore::B_GY],
+                initial.x[fusioncore::B_GZ]);
             }
           } else {
-            RCLCPP_WARN(get_logger(),
-              "Bias window aborted (robot moved). Starting with zero bias.");
+            RCLCPP_WARN(
+              get_logger(), "Bias window aborted (robot moved). Starting with zero bias.");
           }
 
           fc_->init(initial, t);
-          pending_init_         = false;
+          pending_init_ = false;
           init_window_collecting_ = false;
           RCLCPP_INFO(get_logger(), "Filter initialized at t=%.3f", t);
         }
@@ -1071,8 +1101,8 @@ private:
     if (!fc_->is_initialized()) return;
 
     std::string imu_frame = imu_frame_override_.empty()
-      ? (msg->header.frame_id.empty() ? "imu_link" : msg->header.frame_id)
-      : imu_frame_override_;
+                              ? (msg->header.frame_id.empty() ? "imu_link" : msg->header.frame_id)
+                              : imu_frame_override_;
 
     // On the first IMU message, confirm the resolved frame matches what
     // validate_transforms assumed. If they differ, the TF lookup will fail
@@ -1081,7 +1111,8 @@ private:
       imu_frame_resolved_ = imu_frame;
       std::string validated_frame = imu_frame_override_.empty() ? "imu_link" : imu_frame_override_;
       if (imu_frame_resolved_ != validated_frame) {
-        RCLCPP_WARN(get_logger(),
+        RCLCPP_WARN(
+          get_logger(),
           "IMU frame mismatch: TF validation checked '%s' but first message has frame_id '%s'. "
           "Set imu.frame_id: \"%s\" in your config to fix the startup validation warning.",
           validated_frame.c_str(), imu_frame_resolved_.c_str(), imu_frame_resolved_.c_str());
@@ -1098,13 +1129,12 @@ private:
         // IMU driver already removed gravity → add specific force back so the
         // filter measurement model (which expects specific force) is consistent.
         tf2::Vector3 g_base = gravity_in_body_frame();
-        ax += g_base.x(); ay += g_base.y(); az += g_base.z();
+        ax += g_base.x();
+        ay += g_base.y();
+        az += g_base.z();
       }
-      fc_->update_imu(t,
-        msg->angular_velocity.x,
-        msg->angular_velocity.y,
-        msg->angular_velocity.z,
-        ax, ay, az);
+      fc_->update_imu(
+        t, msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z, ax, ay, az);
       // No frame rotation needed: IMU is already in base_frame
       fuse_imu_orientation_if_valid(t, msg, std::nullopt);
       return;
@@ -1112,45 +1142,38 @@ private:
 
     geometry_msgs::msg::TransformStamped tf_stamped;
     try {
-      tf_stamped = tf_buffer_->lookupTransform(
-        base_frame_, imu_frame, tf2::TimePointZero);
+      tf_stamped = tf_buffer_->lookupTransform(base_frame_, imu_frame, tf2::TimePointZero);
     } catch (const tf2::TransformException & ex) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000,
         "Cannot transform IMU from %s to %s: %s"
         " -- Fix: ros2 run tf2_ros static_transform_publisher"
         " --frame-id %s --child-frame-id %s",
-        imu_frame.c_str(), base_frame_.c_str(), ex.what(),
-        base_frame_.c_str(), imu_frame.c_str());
+        imu_frame.c_str(), base_frame_.c_str(), ex.what(), base_frame_.c_str(), imu_frame.c_str());
       double ax = msg->linear_acceleration.x;
       double ay = msg->linear_acceleration.y;
       double az = msg->linear_acceleration.z;
       if (imu_remove_gravity_ && fc_->is_initialized()) {
         tf2::Vector3 g_base = gravity_in_body_frame();
-        ax += g_base.x(); ay += g_base.y(); az += g_base.z();
+        ax += g_base.x();
+        ay += g_base.y();
+        az += g_base.z();
       }
-      fc_->update_imu(t,
-        msg->angular_velocity.x,
-        msg->angular_velocity.y,
-        msg->angular_velocity.z,
-        ax, ay, az);
+      fc_->update_imu(
+        t, msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z, ax, ay, az);
       return;
     }
 
     tf2::Quaternion q(
-      tf_stamped.transform.rotation.x,
-      tf_stamped.transform.rotation.y,
-      tf_stamped.transform.rotation.z,
-      tf_stamped.transform.rotation.w);
+      tf_stamped.transform.rotation.x, tf_stamped.transform.rotation.y,
+      tf_stamped.transform.rotation.z, tf_stamped.transform.rotation.w);
     tf2::Matrix3x3 R(q);
 
-    tf2::Vector3 w(msg->angular_velocity.x,
-                   msg->angular_velocity.y,
-                   msg->angular_velocity.z);
+    tf2::Vector3 w(msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z);
     tf2::Vector3 w_base = R * w;
 
-    tf2::Vector3 a(msg->linear_acceleration.x,
-                   msg->linear_acceleration.y,
-                   msg->linear_acceleration.z);
+    tf2::Vector3 a(
+      msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z);
     tf2::Vector3 a_base = R * a;
 
     if (imu_remove_gravity_ && fc_->is_initialized()) {
@@ -1158,9 +1181,7 @@ private:
       a_base += g_base;
     }
 
-    fc_->update_imu(t,
-      w_base.x(), w_base.y(), w_base.z(),
-      a_base.x(), a_base.y(), a_base.z());
+    fc_->update_imu(t, w_base.x(), w_base.y(), w_base.z(), a_base.x(), a_base.y(), a_base.z());
     // Fix 11: pass the rotation quaternion so orientation is also transformed
     fuse_imu_orientation_if_valid(t, msg, q);
   }
@@ -1177,8 +1198,8 @@ private:
     double t = rclcpp::Time(msg->header.stamp).seconds();
 
     std::string imu_frame = imu2_frame_override_.empty()
-      ? (msg->header.frame_id.empty() ? "imu_link" : msg->header.frame_id)
-      : imu2_frame_override_;
+                              ? (msg->header.frame_id.empty() ? "imu_link" : msg->header.frame_id)
+                              : imu2_frame_override_;
 
     if (imu_frame == base_frame_) {
       double ax = msg->linear_acceleration.x;
@@ -1186,54 +1207,50 @@ private:
       double az = msg->linear_acceleration.z;
       if (imu2_remove_gravity_) {
         tf2::Vector3 g_base = gravity_in_body_frame();
-        ax += g_base.x(); ay += g_base.y(); az += g_base.z();
+        ax += g_base.x();
+        ay += g_base.y();
+        az += g_base.z();
       }
-      fc_->update_imu(t,
-        msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z,
-        ax, ay, az);
+      fc_->update_imu(
+        t, msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z, ax, ay, az);
       fuse_imu_orientation_if_valid(t, msg, std::nullopt);
       return;
     }
 
     geometry_msgs::msg::TransformStamped tf_stamped;
     try {
-      tf_stamped = tf_buffer_->lookupTransform(
-        base_frame_, imu_frame, tf2::TimePointZero);
+      tf_stamped = tf_buffer_->lookupTransform(base_frame_, imu_frame, tf2::TimePointZero);
     } catch (const tf2::TransformException & ex) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000,
         "Cannot transform IMU2 from %s to %s: %s"
         " -- Fix: ros2 run tf2_ros static_transform_publisher"
         " --frame-id %s --child-frame-id %s",
-        imu_frame.c_str(), base_frame_.c_str(), ex.what(),
-        base_frame_.c_str(), imu_frame.c_str());
+        imu_frame.c_str(), base_frame_.c_str(), ex.what(), base_frame_.c_str(), imu_frame.c_str());
       double ax = msg->linear_acceleration.x;
       double ay = msg->linear_acceleration.y;
       double az = msg->linear_acceleration.z;
       if (imu2_remove_gravity_) {
         tf2::Vector3 g_base = gravity_in_body_frame();
-        ax += g_base.x(); ay += g_base.y(); az += g_base.z();
+        ax += g_base.x();
+        ay += g_base.y();
+        az += g_base.z();
       }
-      fc_->update_imu(t,
-        msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z,
-        ax, ay, az);
+      fc_->update_imu(
+        t, msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z, ax, ay, az);
       return;
     }
 
     tf2::Quaternion q(
-      tf_stamped.transform.rotation.x,
-      tf_stamped.transform.rotation.y,
-      tf_stamped.transform.rotation.z,
-      tf_stamped.transform.rotation.w);
+      tf_stamped.transform.rotation.x, tf_stamped.transform.rotation.y,
+      tf_stamped.transform.rotation.z, tf_stamped.transform.rotation.w);
     tf2::Matrix3x3 R(q);
 
-    tf2::Vector3 w(msg->angular_velocity.x,
-                   msg->angular_velocity.y,
-                   msg->angular_velocity.z);
+    tf2::Vector3 w(msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z);
     tf2::Vector3 w_base = R * w;
 
-    tf2::Vector3 a(msg->linear_acceleration.x,
-                   msg->linear_acceleration.y,
-                   msg->linear_acceleration.z);
+    tf2::Vector3 a(
+      msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z);
     tf2::Vector3 a_base = R * a;
 
     if (imu2_remove_gravity_) {
@@ -1241,9 +1258,7 @@ private:
       a_base += g_base;
     }
 
-    fc_->update_imu(t,
-      w_base.x(), w_base.y(), w_base.z(),
-      a_base.x(), a_base.y(), a_base.z());
+    fc_->update_imu(t, w_base.x(), w_base.y(), w_base.z(), a_base.x(), a_base.y(), a_base.z());
     fuse_imu_orientation_if_valid(t, msg, q);
   }
 
@@ -1253,10 +1268,10 @@ private:
   // which is what update_imu() expects.
   tf2::Vector3 gravity_in_body_frame()
   {
-    const fusioncore::State& s = fc_->get_state();
+    const fusioncore::State & s = fc_->get_state();
     // tf2::Quaternion(x,y,z,w): note: NOT (w,x,y,z)
-    tf2::Quaternion q_body(s.x[fusioncore::QX], s.x[fusioncore::QY],
-                           s.x[fusioncore::QZ], s.x[fusioncore::QW]);
+    tf2::Quaternion q_body(
+      s.x[fusioncore::QX], s.x[fusioncore::QY], s.x[fusioncore::QZ], s.x[fusioncore::QW]);
     // In ENU world frame the apparent gravity in a stationary IMU = [0, 0, +9.80665].
     // Rotate from world to body using the inverse quaternion (q maps body→world).
     tf2::Vector3 g_world(0.0, 0.0, 9.80665);
@@ -1269,9 +1284,8 @@ private:
   // even when IMU was mounted at an angle relative to base_frame.
 
   void fuse_imu_orientation_if_valid(
-    double t,
-    const sensor_msgs::msg::Imu::SharedPtr& msg,
-    const std::optional<tf2::Quaternion>& imu_to_base)
+    double t, const sensor_msgs::msg::Imu::SharedPtr & msg,
+    const std::optional<tf2::Quaternion> & imu_to_base)
   {
     // orientation_covariance[0] == -1 means "no orientation data"
     if (msg->orientation_covariance[0] < 0.0) return;
@@ -1281,23 +1295,17 @@ private:
     // update_imu_orientation() already falls back to config defaults when cov is zero.
 
     tf2::Quaternion q_imu(
-      msg->orientation.x,
-      msg->orientation.y,
-      msg->orientation.z,
-      msg->orientation.w);
+      msg->orientation.x, msg->orientation.y, msg->orientation.z, msg->orientation.w);
 
     // Fix 11: rotate orientation from IMU frame to base_frame.
     // q_base = q_imu_to_base * q_imu  (apply mount rotation first)
-    tf2::Quaternion q_base = imu_to_base.has_value()
-      ? (imu_to_base.value() * q_imu).normalized()
-      : q_imu;
+    tf2::Quaternion q_base =
+      imu_to_base.has_value() ? (imu_to_base.value() * q_imu).normalized() : q_imu;
 
     double roll, pitch, yaw;
     tf2::Matrix3x3(q_base).getRPY(roll, pitch, yaw);
 
-    fc_->update_imu_orientation(
-      t, roll, pitch, yaw,
-      msg->orientation_covariance.data());
+    fc_->update_imu_orientation(t, roll, pitch, yaw, msg->orientation_covariance.data());
   }
 
   // ─── Encoder callback ─────────────────────────────────────────────────────
@@ -1308,7 +1316,7 @@ private:
     // If collecting the bias window, abort it if the robot moves.
     if (init_window_collecting_) {
       double speed = std::abs(msg->twist.twist.linear.x);
-      double wz    = std::abs(msg->twist.twist.angular.z);
+      double wz = std::abs(msg->twist.twist.angular.z);
       if (speed > zupt_velocity_threshold_ || wz > zupt_angular_threshold_) {
         init_window_aborted_ = true;
       }
@@ -1322,9 +1330,9 @@ private:
     // Indices: vx=0, vy=7, wz=35 (diagonal elements for linear.x, linear.y, angular.z).
     // Pass -1.0 for any axis where the message reports zero or negative variance,
     // so update_encoder falls back to adaptive/config noise for that axis.
-    const auto& cov = msg->twist.covariance;
-    double var_vx = (cov[0]  > 0.0) ? cov[0]  : -1.0;
-    double var_vy = (cov[7]  > 0.0) ? cov[7]  : -1.0;
+    const auto & cov = msg->twist.covariance;
+    double var_vx = (cov[0] > 0.0) ? cov[0] : -1.0;
+    double var_vy = (cov[7] > 0.0) ? cov[7] : -1.0;
     double var_wz = (cov[35] > 0.0) ? cov[35] : -1.0;
 
     const double vx = msg->twist.twist.linear.x;
@@ -1344,7 +1352,7 @@ private:
     // per step, unscaled by dt) and can exceed the threshold even when the
     // robot is stationary, causing ZUPT to stop firing and yaw to drift.
     if (zupt_enabled_) {
-      double speed = std::sqrt(vx*vx + vy*vy);
+      double speed = std::sqrt(vx * vx + vy * vy);
       if (speed < zupt_velocity_threshold_ && std::abs(wz) < zupt_angular_threshold_) {
         fc_->update_zupt(t, zupt_noise_sigma_);
       }
@@ -1369,9 +1377,9 @@ private:
     // Indices: vx=0, vy=7, wz=35 (diagonal elements for linear.x, linear.y, angular.z).
     // Fall back to encoder2.vel_noise / encoder2.yaw_noise when the message
     // reports zero or negative variance (e.g. KISS-ICP, RealSense T265).
-    const auto& cov = msg->twist.covariance;
-    double var_vx = (cov[0]  > 0.0) ? cov[0]  : enc2_vel_noise_ * enc2_vel_noise_;
-    double var_vy = (cov[7]  > 0.0) ? cov[7]  : enc2_vel_noise_ * enc2_vel_noise_;
+    const auto & cov = msg->twist.covariance;
+    double var_vx = (cov[0] > 0.0) ? cov[0] : enc2_vel_noise_ * enc2_vel_noise_;
+    double var_vy = (cov[7] > 0.0) ? cov[7] : enc2_vel_noise_ * enc2_vel_noise_;
     double var_wz = (cov[35] > 0.0) ? cov[35] : enc2_yaw_noise_ * enc2_yaw_noise_;
 
     const double vx = msg->twist.twist.linear.x;
@@ -1408,7 +1416,7 @@ private:
     const double raw_y = msg->pose.pose.position.y;
     const double raw_z = msg->pose.pose.position.z;
 
-    const auto& q = msg->pose.pose.orientation;
+    const auto & q = msg->pose.pose.orientation;
     double raw_roll, raw_pitch, raw_yaw;
     fusioncore::quat_to_euler(q.w, q.x, q.y, q.z, raw_roll, raw_pitch, raw_yaw);
 
@@ -1417,49 +1425,49 @@ private:
     // start at (0,0,0) and the offset is zero. The anchor still handles the general
     // case where VSLAM initializes after the robot has already moved.
     if (!vslam_origin_set_) {
-      const auto& s = fc_->get_state();
+      const auto & s = fc_->get_state();
       vslam_offset_x_ = s.x[fusioncore::X] - raw_x;
       vslam_offset_y_ = s.x[fusioncore::Y] - raw_y;
       vslam_offset_z_ = s.x[fusioncore::Z] - raw_z;
       vslam_origin_set_ = true;
-      RCLCPP_INFO(get_logger(),
-        "VSLAM: map origin anchored. offset=(%.3f, %.3f, %.3f)",
-        vslam_offset_x_, vslam_offset_y_, vslam_offset_z_);
+      RCLCPP_INFO(
+        get_logger(), "VSLAM: map origin anchored. offset=(%.3f, %.3f, %.3f)", vslam_offset_x_,
+        vslam_offset_y_, vslam_offset_z_);
     }
 
     // Apply offset: translate pose from VSLAM map frame into filter odom frame
     pose.x = raw_x + vslam_offset_x_;
     pose.y = raw_y + vslam_offset_y_;
     pose.z = raw_z + vslam_offset_z_;
-    pose.roll  = raw_roll;
+    pose.roll = raw_roll;
     pose.pitch = raw_pitch;
-    pose.yaw   = raw_yaw;
+    pose.yaw = raw_yaw;
 
     // Extract covariance from pose.covariance (6x6, row-major, [x,y,z,rx,ry,rz]).
     // Diagonal indices: x=0, y=7, z=14, roll=21, pitch=28, yaw=35.
-    const auto& cov = msg->pose.covariance;
-    constexpr double kMinVarPos    = 1e-4;
+    const auto & cov = msg->pose.covariance;
+    constexpr double kMinVarPos = 1e-4;
     constexpr double kMinVarOrient = 1e-6;
 
-    const double var_x   = cov[0];
-    const double var_y   = cov[7];
-    const double var_z   = cov[14];
-    const double var_r   = cov[21];
-    const double var_p   = cov[28];
+    const double var_x = cov[0];
+    const double var_y = cov[7];
+    const double var_z = cov[14];
+    const double var_r = cov[21];
+    const double var_p = cov[28];
     const double var_yaw = cov[35];
 
     if (var_x > 0.0 && var_y > 0.0 && var_z > 0.0) {
-      pose.has_position_cov  = true;
-      pose.position_cov(0,0) = std::max(var_x, kMinVarPos);
-      pose.position_cov(1,1) = std::max(var_y, kMinVarPos);
-      pose.position_cov(2,2) = std::max(var_z, kMinVarPos);
+      pose.has_position_cov = true;
+      pose.position_cov(0, 0) = std::max(var_x, kMinVarPos);
+      pose.position_cov(1, 1) = std::max(var_y, kMinVarPos);
+      pose.position_cov(2, 2) = std::max(var_z, kMinVarPos);
     }
 
     if (var_r > 0.0 && var_p > 0.0 && var_yaw > 0.0) {
-      pose.has_orientation_cov  = true;
-      pose.orientation_cov(0,0) = std::max(var_r,   kMinVarOrient);
-      pose.orientation_cov(1,1) = std::max(var_p,   kMinVarOrient);
-      pose.orientation_cov(2,2) = std::max(var_yaw, kMinVarOrient);
+      pose.has_orientation_cov = true;
+      pose.orientation_cov(0, 0) = std::max(var_r, kMinVarOrient);
+      pose.orientation_cov(1, 1) = std::max(var_p, kMinVarOrient);
+      pose.orientation_cov(2, 2) = std::max(var_yaw, kMinVarOrient);
     }
 
     const bool accepted = fc_->update_pose(t, pose);
@@ -1472,12 +1480,13 @@ private:
       // certainly reinitialized to a new map. Re-anchor to the filter's current
       // position so subsequent measurements are accepted in the new map frame.
       if (vslam_consecutive_rejects_ >= vslam_reinit_n_) {
-        const auto& s = fc_->get_state();
+        const auto & s = fc_->get_state();
         vslam_offset_x_ = s.x[fusioncore::X] - raw_x;
         vslam_offset_y_ = s.x[fusioncore::Y] - raw_y;
         vslam_offset_z_ = s.x[fusioncore::Z] - raw_z;
         vslam_consecutive_rejects_ = 0;
-        RCLCPP_WARN(get_logger(),
+        RCLCPP_WARN(
+          get_logger(),
           "VSLAM: %d consecutive rejections — reinitialization detected. "
           "Re-anchoring map origin. new offset=(%.3f, %.3f, %.3f)",
           vslam_reinit_n_, vslam_offset_x_, vslam_offset_y_, vslam_offset_z_);
@@ -1497,11 +1506,11 @@ private:
     mark_sensor_received("RadarVel");
     if (!fc_->is_initialized()) return;
 
-    const double t  = rclcpp::Time(msg->header.stamp).seconds();
+    const double t = rclcpp::Time(msg->header.stamp).seconds();
     const double vx = msg->twist.twist.linear.x;
     const double vy = msg->twist.twist.linear.y;
 
-    const auto& cov = msg->twist.covariance;
+    const auto & cov = msg->twist.covariance;
     const double var_vx = (cov[0] > 0.0) ? cov[0] : (radar_vel_noise_ * radar_vel_noise_);
     const double var_vy = (cov[7] > 0.0) ? cov[7] : (radar_vel_noise_ * radar_vel_noise_);
 
@@ -1521,19 +1530,19 @@ private:
     mark_sensor_received("GPSVel");
     if (!fc_->is_initialized()) return;
 
-    const double t  = rclcpp::Time(msg->header.stamp).seconds();
-    const double ve = msg->twist.twist.linear.x;   // east
-    const double vn = msg->twist.twist.linear.y;   // north
-    const double vu = msg->twist.twist.linear.z;   // up
+    const double t = rclcpp::Time(msg->header.stamp).seconds();
+    const double ve = msg->twist.twist.linear.x;  // east
+    const double vn = msg->twist.twist.linear.y;  // north
+    const double vu = msg->twist.twist.linear.z;  // up
 
     // Rotate ENU -> body:  v_body = R(q)^T * v_world
-    const auto& s = fc_->get_state();
+    const auto & s = fc_->get_state();
     double R[3][3];
     fusioncore::quat_to_rotation_matrix(s.quat_w(), s.quat_x(), s.quat_y(), s.quat_z(), R);
-    const double vx = R[0][0]*ve + R[1][0]*vn + R[2][0]*vu;
-    const double vy = R[0][1]*ve + R[1][1]*vn + R[2][1]*vu;
+    const double vx = R[0][0] * ve + R[1][0] * vn + R[2][0] * vu;
+    const double vy = R[0][1] * ve + R[1][1] * vn + R[2][1] * vu;
 
-    const auto& cov = msg->twist.covariance;
+    const auto & cov = msg->twist.covariance;
     const double var_vx = (cov[0] > 0.0) ? cov[0] : -1.0;
     const double var_vy = (cov[7] > 0.0) ? cov[7] : -1.0;
 
@@ -1544,8 +1553,10 @@ private:
 
   void gnss_callback(const sensor_msgs::msg::NavSatFix::SharedPtr msg, int source_id = 0)
   {
-    if (source_id == 0) mark_sensor_received("GNSS");
-    else                mark_sensor_received("GNSS2");
+    if (source_id == 0)
+      mark_sensor_received("GNSS");
+    else
+      mark_sensor_received("GNSS2");
     if (!fc_->is_initialized()) return;
 
     if (msg->status.status < 0) return;
@@ -1553,9 +1564,9 @@ private:
     double t = rclcpp::Time(msg->header.stamp).seconds();
 
     fusioncore::sensors::LLAPoint lla;
-    lla.lat_rad = msg->latitude  * M_PI / 180.0;
+    lla.lat_rad = msg->latitude * M_PI / 180.0;
     lla.lon_rad = msg->longitude * M_PI / 180.0;
-    lla.alt_m   = msg->altitude;
+    lla.alt_m = msg->altitude;
 
     // Convert from input CRS (e.g. EPSG:4326 WGS84) to output CRS (e.g. EPSG:4978 ECEF)
     // using PROJ. Default behavior is identical to the hand-coded WGS84→ECEF math.
@@ -1566,8 +1577,8 @@ private:
       gnss_ref_lla_ = lla;
       gnss_ref_ecef_ = ecef;
       gnss_ref_set_ = true;
-      RCLCPP_INFO(get_logger(), "GNSS reference set: lat=%.6f lon=%.6f",
-        msg->latitude, msg->longitude);
+      RCLCPP_INFO(
+        get_logger(), "GNSS reference set: lat=%.6f lon=%.6f", msg->latitude, msg->longitude);
       // Do NOT return: fall through and fuse ENU [0,0,0] as first fix.
     }
 
@@ -1578,9 +1589,10 @@ private:
       double dx = ecef.x - gnss_ref_ecef_.x;
       double dy = ecef.y - gnss_ref_ecef_.y;
       double dz = ecef.z - gnss_ref_ecef_.z;
-      double dist = std::sqrt(dx*dx + dy*dy + dz*dz);
+      double dist = std::sqrt(dx * dx + dy * dy + dz * dz);
       if (dist > 10000.0) {
-        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 2000,
           "GPS fix dropped: %.0fm from reference (Gazebo NavSat bug or hardware glitch)", dist);
         return;
       }
@@ -1592,9 +1604,8 @@ private:
     if (convert_to_enu_at_reference_) {
       enu = fusioncore::sensors::ecef_to_enu(ecef, gnss_ref_ecef_, gnss_ref_lla_);
     } else {
-      enu = Eigen::Vector3d(ecef.x - gnss_ref_ecef_.x,
-                            ecef.y - gnss_ref_ecef_.y,
-                            ecef.z - gnss_ref_ecef_.z);
+      enu = Eigen::Vector3d(
+        ecef.x - gnss_ref_ecef_.x, ecef.y - gnss_ref_ecef_.y, ecef.z - gnss_ref_ecef_.z);
     }
 
     fusioncore::sensors::GnssFix fix;
@@ -1607,9 +1618,15 @@ private:
     //    1 = STATUS_SBAS_FIX → DGPS_FIX
     //    2 = STATUS_GBAS_FIX → RTK_FIXED (RTK/GBAS augmented)
     switch (msg->status.status) {
-      case 2:  fix.fix_type = fusioncore::sensors::GnssFixType::RTK_FIXED; break;
-      case 1:  fix.fix_type = fusioncore::sensors::GnssFixType::DGPS_FIX; break;
-      default: fix.fix_type = fusioncore::sensors::GnssFixType::GPS_FIX;  break;
+      case 2:
+        fix.fix_type = fusioncore::sensors::GnssFixType::RTK_FIXED;
+        break;
+      case 1:
+        fix.fix_type = fusioncore::sensors::GnssFixType::DGPS_FIX;
+        break;
+      default:
+        fix.fix_type = fusioncore::sensors::GnssFixType::GPS_FIX;
+        break;
     }
     fix.source_id = source_id;
     fix.lever_arm = (source_id == 0) ? gnss_lever_arm_ : gnss_lever_arm2_;
@@ -1625,24 +1642,23 @@ private:
     // wheel/IMU drift >~1 cm between fixes then fails the chi² outlier gate
     // (16.27 at 3 DoF). Floor σxy = 2 cm, σz = 5 cm so small integration
     // drift stays inside the gate while still benefitting from RTK precision.
-    constexpr double kMinVarXY = 4e-4;    // σ = 0.02 m
-    constexpr double kMinVarZ  = 2.5e-3;  // σ = 0.05 m
+    constexpr double kMinVarXY = 4e-4;   // σ = 0.02 m
+    constexpr double kMinVarZ = 2.5e-3;  // σ = 0.05 m
     if (msg->position_covariance_type == 3) {
       // Full 3x3 covariance available: use it directly including off-diagonals
       Eigen::Matrix3d cov;
       for (int i = 0; i < 3; ++i)
-        for (int j = 0; j < 3; ++j)
-          cov(i, j) = msg->position_covariance[i*3 + j];
+        for (int j = 0; j < 3; ++j) cov(i, j) = msg->position_covariance[i * 3 + j];
 
       // Validate diagonal is positive
-      if (cov(0,0) > 0.0 && cov(1,1) > 0.0 && cov(2,2) > 0.0) {
-        if (cov(0,0) < kMinVarXY) cov(0,0) = kMinVarXY;
-        if (cov(1,1) < kMinVarXY) cov(1,1) = kMinVarXY;
-        if (cov(2,2) < kMinVarZ)  cov(2,2) = kMinVarZ;
+      if (cov(0, 0) > 0.0 && cov(1, 1) > 0.0 && cov(2, 2) > 0.0) {
+        if (cov(0, 0) < kMinVarXY) cov(0, 0) = kMinVarXY;
+        if (cov(1, 1) < kMinVarXY) cov(1, 1) = kMinVarXY;
+        if (cov(2, 2) < kMinVarZ) cov(2, 2) = kMinVarZ;
         fix.has_full_covariance = true;
         fix.full_covariance = cov;
-        fix.hdop = std::sqrt((cov(0,0) + cov(1,1)) / 2.0);  // for validity check
-        fix.vdop = std::sqrt(cov(2,2));
+        fix.hdop = std::sqrt((cov(0, 0) + cov(1, 1)) / 2.0);  // for validity check
+        fix.vdop = std::sqrt(cov(2, 2));
         fix.satellites = 4;  // Fix 10: honest minimum: was hardcoded 6, always passed quality gate
       } else {
         fix.hdop = 1.5;
@@ -1653,7 +1669,7 @@ private:
       // Diagonal covariance available
       double var_xy = (msg->position_covariance[0] + msg->position_covariance[4]) / 2.0;
       if (var_xy < kMinVarXY) var_xy = kMinVarXY;
-      double var_z  = msg->position_covariance[8];
+      double var_z = msg->position_covariance[8];
       if (var_z < kMinVarZ) var_z = kMinVarZ;
       if (var_xy > 0.0 && var_z > 0.0) {
         fix.hdop = std::sqrt(var_xy);
@@ -1673,22 +1689,21 @@ private:
 
     bool accepted = fc_->update_gnss(t, fix);
     if (!accepted) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000,
         "GNSS fix rejected (fix_type=%d, min=%d, hdop=%.2f, "
         "quality check or Mahalanobis gate)",
-        static_cast<int>(fix.fix_type),
-        static_cast<int>(min_fix_type_),
-        fix.hdop);
+        static_cast<int>(fix.fix_type), static_cast<int>(min_fix_type_), fix.hdop);
     }
 
     // Log heading observability status
     auto fc_status = fc_->get_status();
     if (!fc_status.heading_validated) {
-      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 5000,
         "Heading not yet validated: lever arm inactive. "
         "Distance traveled: %.1fm (need %.1fm), or provide dual antenna / IMU orientation.",
-        fc_status.distance_traveled,
-        5.0);
+        fc_status.distance_traveled, 5.0);
     }
   }
 
@@ -1702,8 +1717,10 @@ private:
 
   void gps_fix_callback(const gps_msgs::msg::GPSFix::SharedPtr msg, int source_id = 0)
   {
-    if (source_id == 0) mark_sensor_received("GNSS");
-    else                mark_sensor_received("GNSS2");
+    if (source_id == 0)
+      mark_sensor_received("GNSS");
+    else
+      mark_sensor_received("GNSS2");
     if (!fc_->is_initialized()) return;
 
     if (msg->status.status < 0) return;
@@ -1711,27 +1728,29 @@ private:
     double t = rclcpp::Time(msg->header.stamp).seconds();
 
     fusioncore::sensors::LLAPoint lla;
-    lla.lat_rad = msg->latitude  * M_PI / 180.0;
+    lla.lat_rad = msg->latitude * M_PI / 180.0;
     lla.lon_rad = msg->longitude * M_PI / 180.0;
-    lla.alt_m   = msg->altitude;
+    lla.alt_m = msg->altitude;
 
     fusioncore::sensors::ECEFPoint ecef;
     gnss_to_output(lla, ecef);
 
     if (!gnss_ref_set_) {
-      gnss_ref_lla_  = lla;
+      gnss_ref_lla_ = lla;
       gnss_ref_ecef_ = ecef;
-      gnss_ref_set_  = true;
-      RCLCPP_INFO(get_logger(), "GNSS reference set (GPSFix): lat=%.6f lon=%.6f",
-        msg->latitude, msg->longitude);
+      gnss_ref_set_ = true;
+      RCLCPP_INFO(
+        get_logger(), "GNSS reference set (GPSFix): lat=%.6f lon=%.6f", msg->latitude,
+        msg->longitude);
     }
 
     {
       double dx = ecef.x - gnss_ref_ecef_.x;
       double dy = ecef.y - gnss_ref_ecef_.y;
       double dz = ecef.z - gnss_ref_ecef_.z;
-      if (std::sqrt(dx*dx + dy*dy + dz*dz) > 10000.0) {
-        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+      if (std::sqrt(dx * dx + dy * dy + dz * dz) > 10000.0) {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 2000,
           "GPSFix dropped: more than 10km from reference (hardware glitch)");
         return;
       }
@@ -1741,9 +1760,8 @@ private:
     if (convert_to_enu_at_reference_) {
       enu = fusioncore::sensors::ecef_to_enu(ecef, gnss_ref_ecef_, gnss_ref_lla_);
     } else {
-      enu = Eigen::Vector3d(ecef.x - gnss_ref_ecef_.x,
-                            ecef.y - gnss_ref_ecef_.y,
-                            ecef.z - gnss_ref_ecef_.z);
+      enu = Eigen::Vector3d(
+        ecef.x - gnss_ref_ecef_.x, ecef.y - gnss_ref_ecef_.y, ecef.z - gnss_ref_ecef_.z);
     }
 
     fusioncore::sensors::GnssFix fix;
@@ -1759,21 +1777,26 @@ private:
     using S = gps_msgs::msg::GPSStatus;
     switch (msg->status.status) {
       case S::STATUS_RTK_FIX:
-        fix.fix_type = fusioncore::sensors::GnssFixType::RTK_FIXED; break;
+        fix.fix_type = fusioncore::sensors::GnssFixType::RTK_FIXED;
+        break;
       case S::STATUS_RTK_FLOAT:
-        fix.fix_type = fusioncore::sensors::GnssFixType::RTK_FLOAT; break;
+        fix.fix_type = fusioncore::sensors::GnssFixType::RTK_FLOAT;
+        break;
       case S::STATUS_GBAS_FIX:
-        fix.fix_type = fusioncore::sensors::GnssFixType::RTK_FIXED; break;
+        fix.fix_type = fusioncore::sensors::GnssFixType::RTK_FIXED;
+        break;
       case S::STATUS_DGPS_FIX:
       case S::STATUS_SBAS_FIX:
-        fix.fix_type = fusioncore::sensors::GnssFixType::DGPS_FIX; break;
+        fix.fix_type = fusioncore::sensors::GnssFixType::DGPS_FIX;
+        break;
       default:
-        fix.fix_type = fusioncore::sensors::GnssFixType::GPS_FIX; break;
+        fix.fix_type = fusioncore::sensors::GnssFixType::GPS_FIX;
+        break;
     }
 
     // satellites_used is directly available in GPSFix (NavSatFix has no equivalent).
-    fix.satellites = (msg->status.satellites_used > 0)
-      ? static_cast<int>(msg->status.satellites_used) : 4;
+    fix.satellites =
+      (msg->status.satellites_used > 0) ? static_cast<int>(msg->status.satellites_used) : 4;
 
     // Covariance priority:
     //   1. Full 3x3 from position_covariance_type==3 (most accurate)
@@ -1783,26 +1806,26 @@ private:
     //   5. Defaults
 
     constexpr double kMinVarXY = 4e-4;   // sigma = 0.02 m
-    constexpr double kMinVarZ  = 2.5e-3; // sigma = 0.05 m
+    constexpr double kMinVarZ = 2.5e-3;  // sigma = 0.05 m
 
     if (msg->position_covariance_type == gps_msgs::msg::GPSFix::COVARIANCE_TYPE_KNOWN) {
       Eigen::Matrix3d cov;
       for (int i = 0; i < 3; ++i)
-        for (int j = 0; j < 3; ++j)
-          cov(i, j) = msg->position_covariance[i*3 + j];
-      if (cov(0,0) > 0.0 && cov(1,1) > 0.0 && cov(2,2) > 0.0) {
-        if (cov(0,0) < kMinVarXY) cov(0,0) = kMinVarXY;
-        if (cov(1,1) < kMinVarXY) cov(1,1) = kMinVarXY;
-        if (cov(2,2) < kMinVarZ)  cov(2,2) = kMinVarZ;
+        for (int j = 0; j < 3; ++j) cov(i, j) = msg->position_covariance[i * 3 + j];
+      if (cov(0, 0) > 0.0 && cov(1, 1) > 0.0 && cov(2, 2) > 0.0) {
+        if (cov(0, 0) < kMinVarXY) cov(0, 0) = kMinVarXY;
+        if (cov(1, 1) < kMinVarXY) cov(1, 1) = kMinVarXY;
+        if (cov(2, 2) < kMinVarZ) cov(2, 2) = kMinVarZ;
         fix.has_full_covariance = true;
         fix.full_covariance = cov;
-        fix.hdop = std::sqrt((cov(0,0) + cov(1,1)) / 2.0);
-        fix.vdop = std::sqrt(cov(2,2));
+        fix.hdop = std::sqrt((cov(0, 0) + cov(1, 1)) / 2.0);
+        fix.vdop = std::sqrt(cov(2, 2));
       } else {
         fix.hdop = 1.5;
         fix.vdop = 2.0;
       }
-    } else if (msg->position_covariance_type >= gps_msgs::msg::GPSFix::COVARIANCE_TYPE_APPROXIMATED) {
+    } else if (
+      msg->position_covariance_type >= gps_msgs::msg::GPSFix::COVARIANCE_TYPE_APPROXIMATED) {
       double var_xy = (msg->position_covariance[0] + msg->position_covariance[4]) / 2.0;
       if (var_xy < kMinVarXY) var_xy = kMinVarXY;
       double var_z = msg->position_covariance[8];
@@ -1817,15 +1840,15 @@ private:
     } else if (msg->err_horz > 0.0 && msg->err_vert > 0.0) {
       // err_horz/err_vert are 95% CI bounds in meters. Convert to 1-sigma variance.
       double sigma_xy = msg->err_horz / 1.96;
-      double sigma_z  = msg->err_vert / 1.96;
+      double sigma_z = msg->err_vert / 1.96;
       double var_xy = sigma_xy * sigma_xy;
-      double var_z  = sigma_z  * sigma_z;
+      double var_z = sigma_z * sigma_z;
       if (var_xy < kMinVarXY) var_xy = kMinVarXY;
-      if (var_z  < kMinVarZ)  var_z  = kMinVarZ;
+      if (var_z < kMinVarZ) var_z = kMinVarZ;
       Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
-      cov(0,0) = var_xy;
-      cov(1,1) = var_xy;
-      cov(2,2) = var_z;
+      cov(0, 0) = var_xy;
+      cov(1, 1) = var_xy;
+      cov(2, 2) = var_z;
       fix.has_full_covariance = true;
       fix.full_covariance = cov;
       fix.hdop = std::sqrt(var_xy);
@@ -1842,21 +1865,20 @@ private:
 
     bool accepted = fc_->update_gnss(t, fix);
     if (!accepted) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000,
         "GPSFix rejected (fix_type=%d, min=%d, hdop=%.2f, "
         "quality check or Mahalanobis gate)",
-        static_cast<int>(fix.fix_type),
-        static_cast<int>(min_fix_type_),
-        fix.hdop);
+        static_cast<int>(fix.fix_type), static_cast<int>(min_fix_type_), fix.hdop);
     }
 
     auto fc_status = fc_->get_status();
     if (!fc_status.heading_validated) {
-      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 5000,
         "Heading not yet validated: lever arm inactive. "
         "Distance traveled: %.1fm (need %.1fm), or provide dual antenna / IMU orientation.",
-        fc_status.distance_traveled,
-        5.0);
+        fc_status.distance_traveled, 5.0);
     }
   }
 
@@ -1894,7 +1916,8 @@ private:
     }
 
     if (!orientation_valid) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 10000,
         "Dual antenna heading message has invalid orientation covariance."
         " Check your GPS driver configuration.");
       return;
@@ -1902,10 +1925,7 @@ private:
 
     // Extract yaw from quaternion
     tf2::Quaternion q(
-      msg->orientation.x,
-      msg->orientation.y,
-      msg->orientation.z,
-      msg->orientation.w);
+      msg->orientation.x, msg->orientation.y, msg->orientation.z, msg->orientation.w);
 
     double roll, pitch, yaw;
     tf2::Matrix3x3(q).getRPY(roll, pitch, yaw);
@@ -1916,14 +1936,13 @@ private:
     double yaw_sigma = (yaw_variance > 0.0) ? std::sqrt(yaw_variance) : 0.02;
 
     fusioncore::sensors::GnssHeading heading;
-    heading.heading_rad  = yaw;
+    heading.heading_rad = yaw;
     heading.accuracy_rad = yaw_sigma;
-    heading.valid        = true;
+    heading.valid = true;
 
     bool accepted = fc_->update_gnss_heading(t, heading);
     if (!accepted) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-        "GNSS heading update rejected");
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "GNSS heading update rejected");
     }
   }
 
@@ -1958,27 +1977,27 @@ private:
     }
 
     // Normalize to [-pi, pi]
-    while (yaw_enu >  M_PI) yaw_enu -= 2.0 * M_PI;
+    while (yaw_enu > M_PI) yaw_enu -= 2.0 * M_PI;
     while (yaw_enu < -M_PI) yaw_enu += 2.0 * M_PI;
 
     // Build heading struct
     fusioncore::sensors::GnssHeading heading;
-    heading.heading_rad  = yaw_enu;
+    heading.heading_rad = yaw_enu;
     heading.accuracy_rad = (msg->variance > 0.0) ? std::sqrt(msg->variance) : 0.02;
-    heading.valid        = true;
+    heading.valid = true;
 
     // Note magnetic vs geographic north
     // Geographic is preferred: magnetic has declination error
     if (msg->reference == compass_msgs::msg::Azimuth::REFERENCE_MAGNETIC) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 30000,
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 30000,
         "compass_msgs/Azimuth uses MAGNETIC north reference. "
         "Consider using GEOGRAPHIC for better accuracy.");
     }
 
     bool accepted = fc_->update_gnss_heading(t, heading);
     if (!accepted) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-        "Azimuth heading update rejected");
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "Azimuth heading update rejected");
     }
   }
 
@@ -1989,13 +2008,13 @@ private:
     std::lock_guard<std::mutex> lock(fc_mutex_);
     if (!fc_->is_initialized()) return;
 
-    const fusioncore::State& s = fc_->get_state();
+    const fusioncore::State & s = fc_->get_state();
     auto stamp = now();
 
     nav_msgs::msg::Odometry odom;
-    odom.header.stamp    = stamp;
+    odom.header.stamp = stamp;
     odom.header.frame_id = odom_frame_;
-    odom.child_frame_id  = base_frame_;
+    odom.child_frame_id = base_frame_;
 
     odom.pose.pose.position.x = s.x[fusioncore::X];
     odom.pose.pose.position.y = s.x[fusioncore::Y];
@@ -2006,9 +2025,9 @@ private:
     odom.pose.pose.orientation.z = s.x[fusioncore::QZ];
     odom.pose.pose.orientation.w = s.x[fusioncore::QW];
 
-    odom.twist.twist.linear.x  = s.x[fusioncore::VX];
-    odom.twist.twist.linear.y  = s.x[fusioncore::VY];
-    odom.twist.twist.linear.z  = force_2d_ ? 0.0 : s.x[fusioncore::VZ];
+    odom.twist.twist.linear.x = s.x[fusioncore::VX];
+    odom.twist.twist.linear.y = s.x[fusioncore::VY];
+    odom.twist.twist.linear.z = force_2d_ ? 0.0 : s.x[fusioncore::VZ];
     odom.twist.twist.angular.x = s.x[fusioncore::WX];
     odom.twist.twist.angular.y = s.x[fusioncore::WY];
     odom.twist.twist.angular.z = s.x[fusioncore::WZ];
@@ -2017,26 +2036,20 @@ private:
     // pose.covariance is 6x6 row-major for [x, y, z, roll, pitch, yaw].
     // twist.covariance is 6x6 row-major for [vx, vy, vz, wx, wy, wz].
     // Extract the relevant 6x6 sub-blocks from the 21x21 P matrix.
-    const fusioncore::StateMatrix& P = s.P;
+    const fusioncore::StateMatrix & P = s.P;
     // Pose covariance: [x, y, z, roll, pitch, yaw] (ROS convention).
     // Map orientation slots to QX, QY, QZ (3 of 4 quaternion components).
     // QW is omitted: it's constrained by unit norm and has near-zero variance.
-    static constexpr int pose_idx[6] = {
-      fusioncore::X, fusioncore::Y, fusioncore::Z,
-      fusioncore::QX, fusioncore::QY, fusioncore::QZ
-    };
+    static constexpr int pose_idx[6] = {fusioncore::X,  fusioncore::Y,  fusioncore::Z,
+                                        fusioncore::QX, fusioncore::QY, fusioncore::QZ};
     for (int i = 0; i < 6; ++i)
-      for (int j = 0; j < 6; ++j)
-        odom.pose.covariance[i * 6 + j] = P(pose_idx[i], pose_idx[j]);
+      for (int j = 0; j < 6; ++j) odom.pose.covariance[i * 6 + j] = P(pose_idx[i], pose_idx[j]);
 
     // Twist state indices: VX=6,VY=7,VZ=8,WX=9,WY=10,WZ=11
-    static constexpr int twist_idx[6] = {
-      fusioncore::VX, fusioncore::VY, fusioncore::VZ,
-      fusioncore::WX, fusioncore::WY, fusioncore::WZ
-    };
+    static constexpr int twist_idx[6] = {fusioncore::VX, fusioncore::VY, fusioncore::VZ,
+                                         fusioncore::WX, fusioncore::WY, fusioncore::WZ};
     for (int i = 0; i < 6; ++i)
-      for (int j = 0; j < 6; ++j)
-        odom.twist.covariance[i * 6 + j] = P(twist_idx[i], twist_idx[j]);
+      for (int j = 0; j < 6; ++j) odom.twist.covariance[i * 6 + j] = P(twist_idx[i], twist_idx[j]);
 
     odom_pub_->publish(odom);
 
@@ -2044,13 +2057,13 @@ private:
     // Nav2 pose initializer, and many visualization tools.
     geometry_msgs::msg::PoseWithCovarianceStamped pose_msg;
     pose_msg.header = odom.header;
-    pose_msg.pose   = odom.pose;
+    pose_msg.pose = odom.pose;
     pose_pub_->publish(pose_msg);
 
     geometry_msgs::msg::TransformStamped tf;
-    tf.header.stamp    = stamp;
+    tf.header.stamp = stamp;
     tf.header.frame_id = odom_frame_;
-    tf.child_frame_id  = base_frame_;
+    tf.child_frame_id = base_frame_;
 
     tf.transform.translation.x = s.x[fusioncore::X];
     tf.transform.translation.y = s.x[fusioncore::Y];
@@ -2073,25 +2086,22 @@ private:
     if (!fc_->is_initialized()) return;
 
     auto status = fc_->get_status();
-    auto stamp  = now();
+    auto stamp = now();
 
     diagnostic_msgs::msg::DiagnosticArray diag_array;
     diag_array.header.stamp = stamp;
 
     auto make_status = [&](
-      const std::string& name,
-      uint8_t level,
-      const std::string& message,
-      const std::vector<std::pair<std::string,std::string>>& kv)
-    {
+                         const std::string & name, uint8_t level, const std::string & message,
+                         const std::vector<std::pair<std::string, std::string>> & kv) {
       diagnostic_msgs::msg::DiagnosticStatus s;
-      s.name        = "fusioncore: " + name;
+      s.name = "fusioncore: " + name;
       s.hardware_id = "fusioncore";
-      s.level       = level;
-      s.message     = message;
-      for (const auto& [k, v] : kv) {
+      s.level = level;
+      s.message = message;
+      for (const auto & [k, v] : kv) {
         diagnostic_msgs::msg::KeyValue kv_msg;
-        kv_msg.key   = k;
+        kv_msg.key = k;
         kv_msg.value = v;
         s.values.push_back(kv_msg);
       }
@@ -2100,56 +2110,64 @@ private:
 
     auto health_to_level = [](fusioncore::SensorHealth h) -> uint8_t {
       switch (h) {
-        case fusioncore::SensorHealth::OK:       return diagnostic_msgs::msg::DiagnosticStatus::OK;
-        case fusioncore::SensorHealth::STALE:    return diagnostic_msgs::msg::DiagnosticStatus::WARN;
-        case fusioncore::SensorHealth::NOT_INIT: return diagnostic_msgs::msg::DiagnosticStatus::WARN;
+        case fusioncore::SensorHealth::OK:
+          return diagnostic_msgs::msg::DiagnosticStatus::OK;
+        case fusioncore::SensorHealth::STALE:
+          return diagnostic_msgs::msg::DiagnosticStatus::WARN;
+        case fusioncore::SensorHealth::NOT_INIT:
+          return diagnostic_msgs::msg::DiagnosticStatus::WARN;
       }
       return diagnostic_msgs::msg::DiagnosticStatus::WARN;
     };
 
     auto health_to_str = [](fusioncore::SensorHealth h) -> std::string {
       switch (h) {
-        case fusioncore::SensorHealth::OK:       return "OK";
-        case fusioncore::SensorHealth::STALE:    return "STALE: no recent data";
-        case fusioncore::SensorHealth::NOT_INIT: return "Not yet initialized";
+        case fusioncore::SensorHealth::OK:
+          return "OK";
+        case fusioncore::SensorHealth::STALE:
+          return "STALE: no recent data";
+        case fusioncore::SensorHealth::NOT_INIT:
+          return "Not yet initialized";
       }
       return "Unknown";
     };
 
     // IMU
-    diag_array.status.push_back(make_status("IMU",
-      health_to_level(status.imu_health),
-      health_to_str(status.imu_health),
+    diag_array.status.push_back(make_status(
+      "IMU", health_to_level(status.imu_health), health_to_str(status.imu_health),
       {{"outlier_count", std::to_string(status.imu_outliers)}}));
 
     // Encoder
-    diag_array.status.push_back(make_status("Encoder",
-      health_to_level(status.encoder_health),
-      health_to_str(status.encoder_health),
+    diag_array.status.push_back(make_status(
+      "Encoder", health_to_level(status.encoder_health), health_to_str(status.encoder_health),
       {{"outlier_count", std::to_string(status.enc_outliers)}}));
 
     // GNSS
-    diag_array.status.push_back(make_status("GNSS",
-      health_to_level(status.gnss_health),
-      health_to_str(status.gnss_health),
-      {{"outlier_count",     std::to_string(status.gnss_outliers)},
-       {"heading_outliers",  std::to_string(status.hdg_outliers)}}));
+    diag_array.status.push_back(make_status(
+      "GNSS", health_to_level(status.gnss_health), health_to_str(status.gnss_health),
+      {{"outlier_count", std::to_string(status.gnss_outliers)},
+       {"heading_outliers", std::to_string(status.hdg_outliers)}}));
 
     // VSLAM (only shown when configured)
     if (!vslam_topic_.empty()) {
-      diag_array.status.push_back(make_status("VSLAM",
-        health_to_level(status.vslam_health),
-        health_to_str(status.vslam_health),
+      diag_array.status.push_back(make_status(
+        "VSLAM", health_to_level(status.vslam_health), health_to_str(status.vslam_health),
         {{"outlier_count", std::to_string(status.vslam_outliers)}}));
     }
 
     // Filter
     auto heading_src_str = [](fusioncore::HeadingSource src) -> std::string {
       switch (src) {
-        case fusioncore::HeadingSource::NONE:            return "NONE: lever arm inactive";
-        case fusioncore::HeadingSource::DUAL_ANTENNA:    return "DUAL_ANTENNA";
-        case fusioncore::HeadingSource::IMU_ORIENTATION: return "IMU_ORIENTATION (9-axis)";
-        case fusioncore::HeadingSource::GPS_TRACK:       return "GPS_TRACK";
+        case fusioncore::HeadingSource::NONE:
+          return "NONE: lever arm inactive";
+        case fusioncore::HeadingSource::DUAL_ANTENNA:
+          return "DUAL_ANTENNA";
+        case fusioncore::HeadingSource::IMU_ORIENTATION:
+          return "IMU_ORIENTATION (9-axis)";
+        case fusioncore::HeadingSource::GPS_TRACK:
+          return "GPS_TRACK";
+        case fusioncore::HeadingSource::GPS_ROTATION:
+          return "GPS_ROTATION";
       }
       return "Unknown";
     };
@@ -2158,16 +2176,17 @@ private:
     std::string filter_msg = "Running";
     if (!status.heading_validated) {
       filter_level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
-      filter_msg   = "Heading not validated: lever arm inactive";
+      filter_msg = "Heading not validated: lever arm inactive";
     }
 
-    diag_array.status.push_back(make_status("Filter",
-      filter_level, filter_msg,
-      {{"heading_source",        heading_src_str(status.heading_source)},
-       {"heading_validated",     status.heading_validated ? "true" : "false"},
-       {"distance_traveled_m",   std::to_string(status.distance_traveled)},
+    diag_array.status.push_back(make_status(
+      "Filter", filter_level, filter_msg,
+      {{"heading_source", heading_src_str(status.heading_source)},
+       {"heading_validated", status.heading_validated ? "true" : "false"},
+       {"last_heading_sigma_rad", std::to_string(status.last_heading_sigma)},
+       {"distance_traveled_m", std::to_string(status.distance_traveled)},
        {"position_uncertainty_m", std::to_string(std::sqrt(status.position_uncertainty))},
-       {"update_count",          std::to_string(status.update_count)}}));
+       {"update_count", std::to_string(status.update_count)}}));
 
     diag_pub_->publish(diag_array);
   }
@@ -2189,11 +2208,13 @@ private:
     // proj_normalize_for_visualization ensures consistent axis order:
     // input: (latitude°, longitude°, altitude_m) for geographic CRS
     // output: (x, y, z) in the output CRS native units
-    PJ* raw = proj_create_crs_to_crs(proj_ctx_,
-      input_gnss_crs_.c_str(), output_crs_.c_str(), nullptr);
+    PJ * raw =
+      proj_create_crs_to_crs(proj_ctx_, input_gnss_crs_.c_str(), output_crs_.c_str(), nullptr);
 
     if (!raw) {
-      RCLCPP_ERROR(get_logger(), "PROJ: failed to create transform %s → %s. "
+      RCLCPP_ERROR(
+        get_logger(),
+        "PROJ: failed to create transform %s → %s. "
         "Check that both CRS strings are valid PROJ identifiers.",
         input_gnss_crs_.c_str(), output_crs_.c_str());
       return;
@@ -2208,15 +2229,22 @@ private:
     }
 
     proj_initialized_ = true;
-    RCLCPP_INFO(get_logger(), "PROJ: transform ready (%s → %s)",
-      input_gnss_crs_.c_str(), output_crs_.c_str());
+    RCLCPP_INFO(
+      get_logger(), "PROJ: transform ready (%s → %s)", input_gnss_crs_.c_str(),
+      output_crs_.c_str());
   }
 
   void deinit_proj()
   {
     std::lock_guard<std::mutex> lock(proj_mutex_);
-    if (proj_)    { proj_destroy(proj_);          proj_    = nullptr; }
-    if (proj_ctx_){ proj_context_destroy(proj_ctx_); proj_ctx_ = nullptr; }
+    if (proj_) {
+      proj_destroy(proj_);
+      proj_ = nullptr;
+    }
+    if (proj_ctx_) {
+      proj_context_destroy(proj_ctx_);
+      proj_ctx_ = nullptr;
+    }
     proj_initialized_ = false;
   }
 
@@ -2238,20 +2266,17 @@ private:
   // (phi=latitude, lam=longitude) regardless of axis order, so no change is
   // needed there.
   void gnss_to_output(
-    const fusioncore::sensors::LLAPoint& lla,
-    fusioncore::sensors::ECEFPoint& out)
+    const fusioncore::sensors::LLAPoint & lla, fusioncore::sensors::ECEFPoint & out)
   {
     if (!proj_initialized_) {
       RCLCPP_ERROR_ONCE(get_logger(), "PROJ transform not initialized");
       return;
     }
     std::lock_guard<std::mutex> lock(proj_mutex_);
-    PJ_COORD c = {{
-      lla.lon_rad * 180.0 / M_PI,   // slot 0 = longitude (visualization order)
-      lla.lat_rad * 180.0 / M_PI,   // slot 1 = latitude
-      lla.alt_m,
-      HUGE_VAL
-    }};
+    PJ_COORD c = {
+      {lla.lon_rad * 180.0 / M_PI,  // slot 0 = longitude (visualization order)
+       lla.lat_rad * 180.0 / M_PI,  // slot 1 = latitude
+       lla.alt_m, HUGE_VAL}};
     PJ_COORD r = proj_trans(proj_, PJ_FWD, c);
     out.x = r.xyz.x;
     out.y = r.xyz.y;
@@ -2262,108 +2287,107 @@ private:
   // Bug 2 fix: phi and lam come back in degrees after normalization,
   // so we convert to radians before storing in LLAPoint.
   void output_to_gnss(
-    const fusioncore::sensors::ECEFPoint& in,
-    fusioncore::sensors::LLAPoint& lla)
+    const fusioncore::sensors::ECEFPoint & in, fusioncore::sensors::LLAPoint & lla)
   {
     if (!proj_initialized_) {
       RCLCPP_ERROR_ONCE(get_logger(), "PROJ transform not initialized");
       return;
     }
     std::lock_guard<std::mutex> lock(proj_mutex_);
-    PJ_COORD c = {{ in.x, in.y, in.z, HUGE_VAL }};
+    PJ_COORD c = {{in.x, in.y, in.z, HUGE_VAL}};
     PJ_COORD r = proj_trans(proj_, PJ_INV, c);
-    lla.lat_rad = r.lpzt.phi * M_PI / 180.0;   // degrees → radians
+    lla.lat_rad = r.lpzt.phi * M_PI / 180.0;  // degrees → radians
     lla.lon_rad = r.lpzt.lam * M_PI / 180.0;
-    lla.alt_m   = r.lpzt.z;
+    lla.alt_m = r.lpzt.z;
   }
 
   // ─── Members ──────────────────────────────────────────────────────────────
 
-  std::unique_ptr<fusioncore::FusionCore>        fc_;
+  std::unique_ptr<fusioncore::FusionCore> fc_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
-  std::shared_ptr<tf2_ros::Buffer>               tf_buffer_;
-  std::shared_ptr<tf2_ros::TransformListener>    tf_listener_;
+  std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
-  rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr          imu_sub_;
-  rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr          imu2_sub_;
-  rclcpp::Subscription<compass_msgs::msg::Azimuth>::SharedPtr     azimuth_sub_;
-  rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr          gnss_heading_sub_;
-  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr        encoder_sub_;
-  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr        encoder2_sub_;
-  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr        vslam_sub_;
-  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr        gnss_vel_sub_;
-  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr        radar_vel_sub_;
-  rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr    gnss_sub_;
-  rclcpp::Subscription<gps_msgs::msg::GPSFix>::SharedPtr          gps_fix_sub_;
-  rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr                gnss2_sub_;
-  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr                       odom_pub_;
+  rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu2_sub_;
+  rclcpp::Subscription<compass_msgs::msg::Azimuth>::SharedPtr azimuth_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr gnss_heading_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr encoder_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr encoder2_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr vslam_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr gnss_vel_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr radar_vel_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr gnss_sub_;
+  rclcpp::Subscription<gps_msgs::msg::GPSFix>::SharedPtr gps_fix_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr gnss2_sub_;
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pose_pub_;
-  rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr         diag_pub_;
-  rclcpp::TimerBase::SharedPtr                                                publish_timer_;
-  rclcpp::TimerBase::SharedPtr                                                diag_timer_;
-  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr                          reset_srv_;
-  rclcpp::Service<fusioncore_ros::srv::FromLL>::SharedPtr                     from_ll_srv_;
+  rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diag_pub_;
+  rclcpp::TimerBase::SharedPtr publish_timer_;
+  rclcpp::TimerBase::SharedPtr diag_timer_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_srv_;
+  rclcpp::Service<fusioncore_ros::srv::FromLL>::SharedPtr from_ll_srv_;
 
   std::string base_frame_;
   std::string odom_frame_;
-  double      publish_rate_;
-  bool        force_2d_    = false;
-  bool        publish_tf_  = true;
-  bool        use_gps_fix_  = false;
+  double publish_rate_;
+  bool force_2d_ = false;
+  bool publish_tf_ = true;
+  bool use_gps_fix_ = false;
   std::string heading_topic_;
   std::string gnss2_topic_;
   std::string azimuth_topic_;
   std::string encoder2_topic_;
-  double      enc2_vel_noise_ = 0.05;
-  double      enc2_yaw_noise_ = 0.02;
+  double enc2_vel_noise_ = 0.05;
+  double enc2_yaw_noise_ = 0.02;
   std::string vslam_topic_;
   std::string vslam_frame_override_;
   // VSLAM map-to-odom frame offset: applied to every VSLAM measurement.
   // Set on first measurement; re-computed on reinitialization detection.
-  bool   vslam_origin_set_         = false;
-  double vslam_offset_x_           = 0.0;
-  double vslam_offset_y_           = 0.0;
-  double vslam_offset_z_           = 0.0;
-  int    vslam_consecutive_rejects_ = 0;
-  int    vslam_reinit_n_           = 10;
+  bool vslam_origin_set_ = false;
+  double vslam_offset_x_ = 0.0;
+  double vslam_offset_y_ = 0.0;
+  double vslam_offset_z_ = 0.0;
+  int vslam_consecutive_rejects_ = 0;
+  int vslam_reinit_n_ = 10;
   std::string gnss_vel_topic_;
   std::string radar_vel_topic_;
-  double      radar_vel_noise_ = 0.1;
+  double radar_vel_noise_ = 0.1;
 
-  bool        pending_init_        = false;
+  bool pending_init_ = false;
 
   // Static bias initialization window
-  double init_window_duration_         = 0.0;
-  bool   init_window_collecting_       = false;
-  bool   init_window_aborted_          = false;
-  double init_window_start_            = 0.0;
-  bool   init_window_start_is_msg_time_ = false;  // true: msg timestamps; false: wall clock
-  int    init_win_n_                   = 0;
+  double init_window_duration_ = 0.0;
+  bool init_window_collecting_ = false;
+  bool init_window_aborted_ = false;
+  double init_window_start_ = 0.0;
+  bool init_window_start_is_msg_time_ = false;  // true: msg timestamps; false: wall clock
+  int init_win_n_ = 0;
   double init_win_wx_ = 0.0, init_win_wy_ = 0.0, init_win_wz_ = 0.0;
   double init_win_ax_ = 0.0, init_win_ay_ = 0.0, init_win_az_ = 0.0;
   double init_win_qw_ = 0.0, init_win_qx_ = 0.0, init_win_qy_ = 0.0, init_win_qz_ = 0.0;
-  int    init_win_orient_n_      = 0;
-  bool        gnss_ref_set_        = false;
-  bool        imu_remove_gravity_  = false;
+  int init_win_orient_n_ = 0;
+  bool gnss_ref_set_ = false;
+  bool imu_remove_gravity_ = false;
   std::string imu_topic_;
   std::string imu_frame_override_;
   std::string imu_frame_resolved_;
   std::string imu2_topic_;
   std::string imu2_frame_override_;
-  bool        imu2_remove_gravity_ = false;
-  double      last_imu_time_       = 0.0;   // timestamp of most recent IMU message
-  fusioncore::sensors::LLAPoint  gnss_ref_lla_;
+  bool imu2_remove_gravity_ = false;
+  double last_imu_time_ = 0.0;  // timestamp of most recent IMU message
+  fusioncore::sensors::LLAPoint gnss_ref_lla_;
   fusioncore::sensors::ECEFPoint gnss_ref_ecef_;
 
-  fusioncore::sensors::GnssFixType  min_fix_type_   = fusioncore::sensors::GnssFixType::GPS_FIX;
-  fusioncore::sensors::GnssLeverArm gnss_lever_arm_;    // primary receiver
-  fusioncore::sensors::GnssLeverArm gnss_lever_arm2_;   // secondary receiver (fix2_topic)
+  fusioncore::sensors::GnssFixType min_fix_type_ = fusioncore::sensors::GnssFixType::GPS_FIX;
+  fusioncore::sensors::GnssLeverArm gnss_lever_arm_;   // primary receiver
+  fusioncore::sensors::GnssLeverArm gnss_lever_arm2_;  // secondary receiver (fix2_topic)
 
   // ZUPT parameters
-  bool   zupt_enabled_            = true;
+  bool zupt_enabled_ = true;
   double zupt_velocity_threshold_ = 0.05;
-  double zupt_angular_threshold_  = 0.05;
-  double zupt_noise_sigma_        = 0.01;
+  double zupt_angular_threshold_ = 0.05;
+  double zupt_noise_sigma_ = 0.01;
 
   // Callback groups: sensor callbacks are mutually exclusive (protect UKF state);
   // publish timer runs in its own group so it never waits on a sensor callback.
@@ -2372,12 +2396,12 @@ private:
   std::mutex fc_mutex_;
 
   // Sensor wait (#28)
-  bool                     wait_for_all_sensors_ = false;
-  double                   sensor_wait_timeout_  = 10.0;
-  double                   activate_time_        = 0.0;
-  bool                     sensor_wait_done_     = false;
-  std::set<std::string>    sensors_expected_;
-  std::set<std::string>    sensors_received_;
+  bool wait_for_all_sensors_ = false;
+  double sensor_wait_timeout_ = 10.0;
+  double activate_time_ = 0.0;
+  bool sensor_wait_done_ = false;
+  std::set<std::string> sensors_expected_;
+  std::set<std::string> sensors_received_;
 
   // Deterministic replay checkpoint (#27)
   std::string checkpoint_path_;
@@ -2388,11 +2412,11 @@ private:
   std::string input_gnss_crs_;
   std::string output_crs_;
   bool convert_to_enu_at_reference_ = true;
-  bool reference_use_first_fix_     = true;
+  bool reference_use_first_fix_ = true;
   std::mutex proj_mutex_;
-  bool       proj_initialized_ = false;
-  PJ        *proj_     = nullptr;
-  PJ_CONTEXT*proj_ctx_ = nullptr;
+  bool proj_initialized_ = false;
+  PJ * proj_ = nullptr;
+  PJ_CONTEXT * proj_ctx_ = nullptr;
 };
 
 int main(int argc, char ** argv)
